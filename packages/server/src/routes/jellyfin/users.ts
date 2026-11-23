@@ -2,6 +2,8 @@ import { Router, type Request, type Response } from 'express';
 import {
   config as appConfig,
   createLogger,
+  getDb,
+  sql,
   encryptString,
   getSimpleTextHash,
   isConfigUuid,
@@ -398,6 +400,22 @@ async function pinOnlySignIn(
   return !!target.profile.lock && userUnlocks(mount.uuid, target.profile, pin);
 }
 
+/** Temporary, read-only login diagnostics. Never log credentials or configuration IDs. */
+async function logAuthFailure(stage: string, uuid?: string): Promise<void> {
+  let record: 'present' | 'absent' | 'not_checked' | 'query_failed' = 'not_checked';
+  if (uuid) {
+    try {
+      const row = await getDb().maybeOne<{ uuid: string }>(
+        sql`SELECT uuid FROM users WHERE uuid = ${uuid}`
+      );
+      record = row ? 'present' : 'absent';
+    } catch {
+      record = 'query_failed';
+    }
+  }
+  logger.warn({ stage, record }, 'jellyfin auth diagnostic');
+}
+
 router.post(
   '/Users/AuthenticateByName',
   jfOptional(async (req, res) => {
@@ -425,6 +443,7 @@ router.post(
       ? account
       : (await resolveConfigAlias(account))?.uuid;
     if (!uuid || (mount && uuid.toLowerCase() !== mount.uuid.toLowerCase())) {
+      await logAuthFailure('uuid_resolution', uuid);
       res.status(401).json({ Message: 'Invalid username or password' });
       return;
     }
@@ -435,6 +454,7 @@ router.post(
     }
     const proven = await checkPassword(uuid, pw);
     if (!proven) {
+      await logAuthFailure('password_validation', uuid);
       const byPin =
         own ?? (mount && wanted ? await pickerTarget(mount, wanted) : null);
       if (!mount || !byPin || !(await pinOnlySignIn(mount, byPin, pw))) {
@@ -466,6 +486,7 @@ router.post(
 
     const userData = await resolveConfig(uuid, encryptedPassword);
     if (!userData) {
+      await logAuthFailure('configuration_load', uuid);
       res.status(401).json({ Message: 'Invalid username or password' });
       return;
     }
