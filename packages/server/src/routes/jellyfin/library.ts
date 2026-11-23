@@ -490,69 +490,86 @@ router.get(
  */
 const TV_INDEX_TTL_MS = 10 * 60_000;
 const TV_INDEX_MAX_ENTRIES = 6;
+type TvSnapshot = { seasons: JellyfinItem[]; episodes: JellyfinItem[] };
 const tvIndex = new Map<string, {
   expires: number;
-  result: Promise<JellyfinItem[]>;
+  result: Promise<TvSnapshot>;
 }>();
 
+/**
+ * Infuse asks for recursive seasons and episodes separately. Build one shared
+ * snapshot so the two queries do not independently traverse every catalog page.
+ * Failed scans are evicted and no partial index is exposed as a complete one.
+ */
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
   catalog: Parameters<typeof getCatalogPage>[1],
   kind: 'season' | 'episode',
   genre?: string
 ): Promise<JellyfinItem[]> {
-  const key = [ctx.scope(), JSON.stringify(catalog), kind, genre ?? ''].join('|');
+  const key = [ctx.scope(), JSON.stringify(catalog), genre ?? ''].join('|');
   const now = Date.now();
-  const hit = tvIndex.get(key);
-  if (hit && hit.expires > now) return hit.result;
-  tvIndex.delete(key);
-
-  const result = (async () => {
-    const engine = await ctx.engine();
-    const output: JellyfinItem[] = [];
-    const seen = new Set<string>();
-    const batchSize = 100;
-    // getCatalogPage is the catalog's pagination authority; do not use its
-    // estimated total as a stopping condition, since it can change mid-scan.
-    for (let offset = 0; ; offset += batchSize) {
-      const page = await getCatalogPage(engine, catalog, {
-        startIndex: offset,
-        limit: batchSize,
-        genre,
-        exactTotal: false,
-      });
-      if (!page.items.length) break;
-      const series = page.items.filter((p) => p.type === 'series');
-      const expanded = await mapLimited(series, ROW_CONCURRENCY, async (p) => {
-        try {
+  let hit = tvIndex.get(key);
+  if (!hit || hit.expires <= now) {
+    tvIndex.delete(key);
+    const result = (async (): Promise<TvSnapshot> => {
+      const engine = await ctx.engine();
+      const seasons: JellyfinItem[] = [];
+      const episodes: JellyfinItem[] = [];
+      const seenSeasons = new Set<string>();
+      const seenEpisodes = new Set<string>();
+      const batchSize = 100;
+      for (let offset = 0; ; offset += batchSize) {
+        const page = await getCatalogPage(engine, catalog, {
+          startIndex: offset,
+          limit: batchSize,
+          genre,
+          exactTotal: false,
+        });
+        if (!page.items.length) break;
+        const series = page.items.filter((p) => p.type === 'series');
+        const expanded = await mapLimited(series, ROW_CONCURRENCY, async (p) => {
           const d = { t: p.type, i: p.id };
-          return kind === 'season'
-            ? (await seasonsForSeries(ctx, d))?.seasons ?? []
-            : (await episodesForSeries(ctx, d))?.episodes ?? [];
-        } catch {
-          return [] as JellyfinItem[];
+          try {
+            const seasonData = await seasonsForSeries(ctx, d);
+            const episodeData = await episodesForSeries(ctx, d);
+            return {
+              seasons: seasonData?.seasons ?? [],
+              episodes: episodeData?.episodes ?? [],
+            };
+          } catch {
+            return { seasons: [] as JellyfinItem[], episodes: [] as JellyfinItem[] };
+          }
+        });
+        for (const group of expanded) {
+          for (const item of group.seasons) {
+            if (seenSeasons.has(item.Id)) continue;
+            seenSeasons.add(item.Id);
+            seasons.push(item);
+          }
+          for (const item of group.episodes) {
+            if (seenEpisodes.has(item.Id)) continue;
+            seenEpisodes.add(item.Id);
+            episodes.push(item);
+          }
         }
-      });
-      for (const children of expanded) {
-        for (const item of children) {
-          if (seen.has(item.Id)) continue;
-          seen.add(item.Id);
-          output.push(item);
-        }
+        if (page.items.length < batchSize) break;
       }
-      if (page.items.length < batchSize) break;
+      return { seasons, episodes };
+    })();
+    hit = { expires: now + TV_INDEX_TTL_MS, result };
+    tvIndex.set(key, hit);
+    void result.catch(() => {
+      if (tvIndex.get(key)?.result === result) tvIndex.delete(key);
+    });
+    while (tvIndex.size > TV_INDEX_MAX_ENTRIES) {
+      const oldest = tvIndex.keys().next().value;
+      if (oldest === undefined) break;
+      tvIndex.delete(oldest);
     }
-    return output;
-  })();
-  tvIndex.set(key, { expires: now + TV_INDEX_TTL_MS, result });
-  // Failed scans must not poison future requests.
-  void result.catch(() => { if (tvIndex.get(key)?.result === result) tvIndex.delete(key); });
-  while (tvIndex.size > TV_INDEX_MAX_ENTRIES) {
-    const oldest = tvIndex.keys().next().value;
-    if (oldest === undefined) break;
-    tvIndex.delete(oldest);
   }
-  return result;
+  const snapshot = await hit.result;
+  return kind === 'season' ? snapshot.seasons : snapshot.episodes;
 }
 
 async function handleItems(
