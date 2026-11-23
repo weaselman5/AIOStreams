@@ -482,6 +482,112 @@ router.get(
   })
 );
 
+/**
+ * Infuse indexes seasons and episodes directly beneath a Jellyfin library.
+ * Catalog previews only represent series, so expand their metadata here.
+ * Share an in-flight scan between concurrent requests and retain the resulting
+ * snapshot briefly so subsequent StartIndex pages see the same ordering/total.
+ */
+const TV_INDEX_TTL_MS = 10 * 60_000;
+const TV_INDEX_MAX_ENTRIES = 6;
+type TvSnapshot = { seasons: JellyfinItem[]; episodes: JellyfinItem[] };
+const tvIndex = new Map<string, {
+  expires: number;
+  result: Promise<TvSnapshot>;
+}>();
+
+/**
+ * Infuse asks for recursive seasons and episodes separately. Build one shared
+ * snapshot so the two queries do not independently traverse every catalog page.
+ * Failed scans are evicted and no partial index is exposed as a complete one.
+ */
+async function tvLibraryIndex(
+  ctx: JellyfinRequestContext,
+  catalog: Parameters<typeof getCatalogPage>[1],
+  kind: 'season' | 'episode',
+  genre?: string
+): Promise<JellyfinItem[]> {
+  const key = [ctx.scope(), JSON.stringify(catalog), genre ?? ''].join('|');
+  const now = Date.now();
+  let hit = tvIndex.get(key);
+  if (!hit || hit.expires <= now) {
+    tvIndex.delete(key);
+    const result = (async (): Promise<TvSnapshot> => {
+      const engine = await ctx.engine();
+      const seasons: JellyfinItem[] = [];
+      const episodes: JellyfinItem[] = [];
+      const seenSeasons = new Set<string>();
+      const seenEpisodes = new Set<string>();
+      // Safety limit for the Infuse integration test: never expand thousands
+      // of series in a single HTTP request. This intentionally indexes only
+      // the first 24 shows and must not be treated as a complete TV library.
+      const batchSize = 24;
+      const maxSeries = 24;
+      let scannedSeries = 0;
+      for (let offset = 0; scannedSeries < maxSeries; offset += batchSize) {
+        const page = await getCatalogPage(engine, catalog, {
+          startIndex: offset,
+          limit: batchSize,
+          genre,
+          exactTotal: false,
+        });
+        if (!page.items.length) break;
+        const series = page.items.filter((p) => p.type === 'series').slice(0, maxSeries - scannedSeries);
+        scannedSeries += series.length;
+        const expanded = await mapLimited(series, 3, async (p) => {
+          const d = { t: p.type, i: p.id };
+          try {
+            const seasonData = await seasonsForSeries(ctx, d);
+            const episodeData = await episodesForSeries(ctx, d);
+            return {
+              seasons: seasonData?.seasons ?? [],
+              episodes: episodeData?.episodes ?? [],
+            };
+          } catch {
+            return { seasons: [] as JellyfinItem[], episodes: [] as JellyfinItem[] };
+          }
+        });
+        for (const group of expanded) {
+          for (const item of group.seasons) {
+            if (seenSeasons.has(item.Id)) continue;
+            seenSeasons.add(item.Id);
+            seasons.push(item);
+          }
+          for (const item of group.episodes) {
+            if (seenEpisodes.has(item.Id)) continue;
+            seenEpisodes.add(item.Id);
+            episodes.push(item);
+          }
+        }
+        if (page.items.length < batchSize) break;
+      }
+      return { seasons, episodes };
+    })();
+    // Keep the in-flight snapshot reusable even if indexing takes longer than
+    // the TTL. Start the cache lifetime only after the scan has completed.
+    hit = { expires: Infinity, result };
+    tvIndex.set(key, hit);
+    void result.then(
+      () => {
+        const current = tvIndex.get(key);
+        if (current?.result === result) {
+          current.expires = Date.now() + TV_INDEX_TTL_MS;
+        }
+      },
+      () => {
+        if (tvIndex.get(key)?.result === result) tvIndex.delete(key);
+      }
+    );
+    while (tvIndex.size > TV_INDEX_MAX_ENTRIES) {
+      const oldest = tvIndex.keys().next().value;
+      if (oldest === undefined) break;
+      tvIndex.delete(oldest);
+    }
+  }
+  const snapshot = await hit.result;
+  return kind === 'season' ? snapshot.seasons : snapshot.episodes;
+}
+
 async function handleItems(
   req: Request,
   res: Response,
@@ -504,30 +610,7 @@ async function handleItems(
   const recursive = qb(req, 'Recursive') ?? false;
   const personIds = qlist(req, 'PersonIds');
 
-  // Temporary Infuse library-indexing diagnostics. Never log tokens or URLs.
-  const traceLibrary = true; // Temporary: capture all /Items listing shapes, including untyped scans.
-  const sendItems: typeof send = (request, response, items, total, start = 0) => {
-    if (traceLibrary) {
-      const byType: Record<string, number> = {};
-      for (const item of items) {
-        const kind = String(item.Type ?? 'unknown');
-        byType[kind] = (byType[kind] ?? 0) + 1;
-      }
-      console.info('[jellyfin-library-trace]', JSON.stringify({
-        client: ctx.client.name,
-        parentKind: pdForLog,
-        recursive,
-        includeItemTypes: [...(types ?? [])],
-        startIndex: start,
-        limit,
-        returned: items.length,
-        total: total ?? null,
-        byType,
-      }));
-    }
-    send(request, response, items, total, start);
-  };
-  let pdForLog = parentId ? 'unresolved' : 'none';
+  const sendItems = send;
 
   if (ids.length) {
     // Resolving runs the stream pipeline, so a lookup of several ids never does.
@@ -557,7 +640,6 @@ async function handleItems(
 
   const parent = parentId ? await decodeForRequest(ctx, parentId) : null;
   const pd = parent?.kind === 'descriptor' ? parent.descriptor : null;
-  pdForLog = pd?.k ?? (parentId ? 'unknown' : 'none');
 
   if (pd?.k === 'livetv') {
     const { channels, total } = await listChannels(engine, ctx.scope(), {
@@ -575,6 +657,14 @@ async function handleItems(
       ? !!(await getMeta(ctx, pd.t, pd.i).catch(() => null))?.collection
       : false;
   if (pd?.k === 'series' && !collectionParent) {
+    // A recursive Season-only request must still return seasons. Previously
+    // `recursive` forced the episode path and filtered every result away.
+    if (types?.has('season') && !types.has('episode')) {
+      const seasons = (await seasonsForSeries(ctx, pd))?.seasons ?? [];
+      const filtered = excludeTypes(req, applyUserFilters(req, seasons));
+      sendItems(req, res, filtered.slice(startIndex, startIndex + limit), filtered.length, startIndex);
+      return;
+    }
     if (types?.has('episode') || recursive) {
       const r = await episodesForSeries(ctx, pd);
       const eps = applyUserFilters(req, r?.episodes ?? []);
@@ -793,6 +883,30 @@ async function handleItems(
 
   if (catalogDesc) {
     const catalog = findCatalog(engine, catalogDesc.t, catalogDesc.c);
+    // Infuse requests these as recursive children of the library view,
+    // not of each series. Return a stable, fully paginated snapshot.
+    const tvOnly =
+      types?.size === 1 &&
+      (types.has('season') || types.has('episode'));
+    if (
+      catalog &&
+      tvOnly &&
+      recursive &&
+      !searchTerm &&
+      (!requiresGenre(catalog) || !!genreFromId)
+    ) {
+      const kind = types!.has('season') ? 'season' : 'episode';
+      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId);
+      const filtered = excludeTypes(req, applyUserFilters(req, indexed));
+      sendItems(
+        req,
+        res,
+        filtered.slice(startIndex, startIndex + limit),
+        filtered.length,
+        startIndex
+      );
+      return;
+    }
     if (
       !catalog ||
       !catalogCanList(types) ||

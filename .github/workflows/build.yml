@@ -1,6 +1,10 @@
 name: Build Addon
 
 on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/infuse-tv-library-indexing
   pull_request:
     branches:
       - main
