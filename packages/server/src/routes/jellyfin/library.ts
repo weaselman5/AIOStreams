@@ -988,6 +988,22 @@ let indexActive = 0;
 type IndexWaiter = { resolve: () => void; reject: (error: Error) => void; signal: AbortSignal; onAbort: () => void };
 const indexWaiters: IndexWaiter[] = [];
 const indexAbortError = () => new Error('Infuse indexing request disconnected');
+let indexRequestNumber = 0;
+let indexPeakHeapMB = 0;
+let indexLastHeartbeat = 0;
+function indexHeapHeartbeat(stage: string, requestNumber: number, types: string) {
+  const now = Date.now();
+  const heapUsedMB = Math.round(process.memoryUsage().heapUsed / 1048576);
+  if (heapUsedMB > indexPeakHeapMB) indexPeakHeapMB = heapUsedMB;
+  if (stage !== 'end' || now - indexLastHeartbeat >= 15000 || heapUsedMB >= 350) {
+    indexLastHeartbeat = now;
+    console.info('[infuse-heap-growth]', JSON.stringify({
+      stage, requestNumber, types, peakHeapMB: indexPeakHeapMB,
+      ...indexMemory(),
+    }));
+  }
+}
+
 function indexMemory() {
   const m = process.memoryUsage();
   const mb = (bytes: number) => Math.round(bytes / 1048576);
@@ -1047,8 +1063,10 @@ router.get(
       limit: qi(req, 'Limit', 0),
     };
     const signal = untilClosed(res);
+    const requestNumber = ++indexRequestNumber;
     let completed = false;
     const before = indexMemory();
+    indexHeapHeartbeat('start', requestNumber, requestInfo.types);
     try {
       const result = await withIndexSlot(signal, async () => {
         if (signal.aborted) return;
@@ -1057,9 +1075,11 @@ router.get(
       completed = !signal.aborted && result === undefined && res.headersSent;
     } finally {
       const durationMs = Date.now() - started;
+      indexHeapHeartbeat('end', requestNumber, requestInfo.types);
       if (durationMs >= 5000 || !completed) {
         console.info('[infuse-index-diagnostic]', JSON.stringify({
           ...requestInfo,
+          requestNumber,
           durationMs,
           completed,
           clientDisconnected: req.destroyed,
