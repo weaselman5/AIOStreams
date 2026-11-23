@@ -607,7 +607,6 @@ async function handleItems(
 
   const parent = parentId ? await decodeForRequest(ctx, parentId) : null;
   const pd = parent?.kind === 'descriptor' ? parent.descriptor : null;
-  pdForLog = pd?.k ?? (parentId ? 'unknown' : 'none');
 
   if (pd?.k === 'livetv') {
     const { channels, total } = await listChannels(engine, ctx.scope(), {
