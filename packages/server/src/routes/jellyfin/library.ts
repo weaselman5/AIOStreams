@@ -507,7 +507,7 @@ async function tvLibraryIndex(
   kind: 'season' | 'episode',
   genre?: string
 ): Promise<JellyfinItem[]> {
-  const key = [ctx.scope(), JSON.stringify(catalog), genre ?? ''].join('|');
+  const key = [ctx.scope(), JSON.stringify(catalog), genre ?? '', kind].join('|');
   const now = Date.now();
   let hit = tvIndex.get(key);
   if (!hit || hit.expires <= now) {
@@ -521,7 +521,7 @@ async function tvLibraryIndex(
       // Safety limit for the Infuse integration test: never expand thousands
       // of series in a single HTTP request. This intentionally indexes only
       // the first 24 shows and must not be treated as a complete TV library.
-      const batchSize = 24;
+      const batchSize = 8;
       const maxSeries = 24;
       let scannedSeries = 0;
       for (let offset = 0; scannedSeries < maxSeries; offset += batchSize) {
@@ -534,11 +534,11 @@ async function tvLibraryIndex(
         if (!page.items.length) break;
         const series = page.items.filter((p) => p.type === 'series').slice(0, maxSeries - scannedSeries);
         scannedSeries += series.length;
-        const expanded = await mapLimited(series, 3, async (p) => {
+        const expanded = await mapLimited(series, 1, async (p) => {
           const d = { t: p.type, i: p.id };
           try {
-            const seasonData = await seasonsForSeries(ctx, d);
-            const episodeData = await episodesForSeries(ctx, d);
+            const seasonData = kind === 'season' ? await seasonsForSeries(ctx, d) : null;
+            const episodeData = kind === 'episode' ? await episodesForSeries(ctx, d) : null;
             return {
               seasons: seasonData?.seasons ?? [],
               episodes: episodeData?.episodes ?? [],
