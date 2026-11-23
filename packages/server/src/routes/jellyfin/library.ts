@@ -483,23 +483,10 @@ router.get(
 );
 
 /**
- * Infuse indexes seasons and episodes directly beneath a Jellyfin library.
- * Catalog previews only represent series, so expand their metadata here.
- * Share an in-flight scan between concurrent requests and retain the resulting
- * snapshot briefly so subsequent StartIndex pages see the same ordering/total.
- */
-const TV_INDEX_TTL_MS = 60_000;
-const TV_INDEX_MAX_ENTRIES = 2;
-type TvSnapshot = { seasons: JellyfinItem[]; episodes: JellyfinItem[] };
-const tvIndex = new Map<string, {
-  expires: number;
-  result: Promise<TvSnapshot>;
-}>();
-
-/**
- * Infuse asks for recursive seasons and episodes separately. Build one shared
- * snapshot so the two queries do not independently traverse every catalog page.
- * Failed scans are evicted and no partial index is exposed as a complete one.
+ * Infuse asks for recursive Season and Episode lists under a library view.
+ * Expand only a bounded set of series per request and retain no library-wide
+ * metadata snapshots. This is a memory-safety bridge, not a full index:
+ * full-library pagination needs a durable index of expanded item IDs.
  */
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
@@ -507,85 +494,38 @@ async function tvLibraryIndex(
   kind: 'season' | 'episode',
   genre?: string
 ): Promise<JellyfinItem[]> {
-  const key = [ctx.scope(), JSON.stringify(catalog), genre ?? '', kind].join('|');
-  const now = Date.now();
-  let hit = tvIndex.get(key);
-  if (!hit || hit.expires <= now) {
-    tvIndex.delete(key);
-    const result = (async (): Promise<TvSnapshot> => {
-      const engine = await ctx.engine();
-      const seasons: JellyfinItem[] = [];
-      const episodes: JellyfinItem[] = [];
-      const seenSeasons = new Set<string>();
-      const seenEpisodes = new Set<string>();
-      // Safety limit for the Infuse integration test: never expand thousands
-      // of series in a single HTTP request. This intentionally indexes only
-      // the first 24 shows and must not be treated as a complete TV library.
-      const batchSize = 8;
-      const maxSeries = 24;
-      let scannedSeries = 0;
-      for (let offset = 0; scannedSeries < maxSeries; offset += batchSize) {
-        const page = await getCatalogPage(engine, catalog, {
-          startIndex: offset,
-          limit: batchSize,
-          genre,
-          exactTotal: false,
-        });
-        if (!page.items.length) break;
-        const series = page.items.filter((p) => p.type === 'series').slice(0, maxSeries - scannedSeries);
-        scannedSeries += series.length;
-        const expanded = await mapLimited(series, 1, async (p) => {
-          const d = { t: p.type, i: p.id };
-          try {
-            const seasonData = kind === 'season' ? await seasonsForSeries(ctx, d) : null;
-            const episodeData = kind === 'episode' ? await episodesForSeries(ctx, d) : null;
-            return {
-              seasons: seasonData?.seasons ?? [],
-              episodes: episodeData?.episodes ?? [],
-            };
-          } catch {
-            return { seasons: [] as JellyfinItem[], episodes: [] as JellyfinItem[] };
-          }
-        });
-        for (const group of expanded) {
-          for (const item of group.seasons) {
-            if (seenSeasons.has(item.Id)) continue;
-            seenSeasons.add(item.Id);
-            seasons.push(item);
-          }
-          for (const item of group.episodes) {
-            if (seenEpisodes.has(item.Id)) continue;
-            seenEpisodes.add(item.Id);
-            episodes.push(item);
-          }
+  const engine = await ctx.engine();
+  const results: JellyfinItem[] = [];
+  const seen = new Set<string>();
+  const batchSize = 4;
+  const maxSeries = 24;
+  for (let offset = 0; offset < maxSeries; offset += batchSize) {
+    const page = await getCatalogPage(engine, catalog, {
+      startIndex: offset,
+      limit: batchSize,
+      genre,
+      exactTotal: false,
+    });
+    if (!page.items.length) break;
+    for (const preview of page.items) {
+      if (preview.type !== 'series') continue;
+      const descriptor = { t: preview.type, i: preview.id };
+      try {
+        const items = kind === 'season'
+          ? (await seasonsForSeries(ctx, descriptor))?.seasons ?? []
+          : (await episodesForSeries(ctx, descriptor))?.episodes ?? [];
+        for (const item of items) {
+          if (seen.has(item.Id)) continue;
+          seen.add(item.Id);
+          results.push(item);
         }
-        if (page.items.length < batchSize) break;
+      } catch {
+        // One unavailable show must not abort the entire library response.
       }
-      return { seasons, episodes };
-    })();
-    // Keep the in-flight snapshot reusable even if indexing takes longer than
-    // the TTL. Start the cache lifetime only after the scan has completed.
-    hit = { expires: Infinity, result };
-    tvIndex.set(key, hit);
-    void result.then(
-      () => {
-        const current = tvIndex.get(key);
-        if (current?.result === result) {
-          current.expires = Date.now() + TV_INDEX_TTL_MS;
-        }
-      },
-      () => {
-        if (tvIndex.get(key)?.result === result) tvIndex.delete(key);
-      }
-    );
-    while (tvIndex.size > TV_INDEX_MAX_ENTRIES) {
-      const oldest = tvIndex.keys().next().value;
-      if (oldest === undefined) break;
-      tvIndex.delete(oldest);
     }
+    if (page.items.length < batchSize) break;
   }
-  const snapshot = await hit.result;
-  return kind === 'season' ? snapshot.seasons : snapshot.episodes;
+  return results;
 }
 
 async function handleItems(
@@ -1043,7 +983,7 @@ async function handleItems(
  * many 200-item pages alongside recursive season scans; without backpressure
  * those requests compete for the same small Node heap.
  */
-const INDEX_MAX_ACTIVE = 2;
+const INDEX_MAX_ACTIVE = 1;
 let indexActive = 0;
 const indexWaiters: Array<() => void> = [];
 async function withIndexSlot<T>(fn: () => Promise<T>): Promise<T> {
