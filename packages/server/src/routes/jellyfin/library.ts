@@ -557,11 +557,21 @@ async function tvLibraryIndex(
       }
       return { seasons, episodes };
     })();
-    hit = { expires: now + TV_INDEX_TTL_MS, result };
+    // Keep the in-flight snapshot reusable even if indexing takes longer than
+    // the TTL. Start the cache lifetime only after the scan has completed.
+    hit = { expires: Infinity, result };
     tvIndex.set(key, hit);
-    void result.catch(() => {
-      if (tvIndex.get(key)?.result === result) tvIndex.delete(key);
-    });
+    void result.then(
+      () => {
+        const current = tvIndex.get(key);
+        if (current?.result === result) {
+          current.expires = Date.now() + TV_INDEX_TTL_MS;
+        }
+      },
+      () => {
+        if (tvIndex.get(key)?.result === result) tvIndex.delete(key);
+      }
+    );
     while (tvIndex.size > TV_INDEX_MAX_ENTRIES) {
       const oldest = tvIndex.keys().next().value;
       if (oldest === undefined) break;
