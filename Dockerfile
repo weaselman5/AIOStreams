@@ -33,6 +33,7 @@ COPY pnpm-lock.yaml ./pnpm-lock.yaml
 COPY patches ./patches
 
 # Install dependencies.
+ENV PYTHON=/usr/bin/python3
 RUN pnpm install --frozen-lockfile
 
 # Copy source files.
