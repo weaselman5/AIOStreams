@@ -504,6 +504,31 @@ async function handleItems(
   const recursive = qb(req, 'Recursive') ?? false;
   const personIds = qlist(req, 'PersonIds');
 
+  // Temporary Infuse library-indexing diagnostics. Never log tokens or URLs.
+  const traceLibrary = true; // Temporary: capture all /Items listing shapes, including untyped scans.
+  const sendItems: typeof send = (request, response, items, total, start = 0) => {
+    if (traceLibrary) {
+      const byType: Record<string, number> = {};
+      for (const item of items) {
+        const kind = String(item.Type ?? 'unknown');
+        byType[kind] = (byType[kind] ?? 0) + 1;
+      }
+      console.info('[jellyfin-library-trace]', JSON.stringify({
+        client: ctx.client.name,
+        parentKind: pdForLog,
+        recursive,
+        includeItemTypes: [...(types ?? [])],
+        startIndex: start,
+        limit,
+        returned: items.length,
+        total: total ?? null,
+        byType,
+      }));
+    }
+    send(request, response, items, total, start);
+  };
+  let pdForLog = parentId ? 'unresolved' : 'none';
+
   if (ids.length) {
     // Resolving runs the stream pipeline, so a lookup of several ids never does.
     const resolve = ids.length === 1 && (wantsVersions(req) ?? false);
@@ -524,7 +549,7 @@ async function handleItems(
       )
     );
     const end = qs(req, 'Limit') ? startIndex + limit : items.length;
-    send(req, res, items.slice(startIndex, end), items.length, startIndex);
+    sendItems(req, res, items.slice(startIndex, end), items.length, startIndex);
     return;
   }
 
@@ -532,6 +557,7 @@ async function handleItems(
 
   const parent = parentId ? await decodeForRequest(ctx, parentId) : null;
   const pd = parent?.kind === 'descriptor' ? parent.descriptor : null;
+  pdForLog = pd?.k ?? (parentId ? 'unknown' : 'none');
 
   if (pd?.k === 'livetv') {
     const { channels, total } = await listChannels(engine, ctx.scope(), {
@@ -539,7 +565,7 @@ async function handleItems(
       limit,
       genre,
     });
-    send(req, res, await channelListItems(ctx, channels), total, startIndex);
+    sendItems(req, res, await channelListItems(ctx, channels), total, startIndex);
     return;
   }
 
@@ -552,7 +578,7 @@ async function handleItems(
     if (types?.has('episode') || recursive) {
       const r = await episodesForSeries(ctx, pd);
       const eps = applyUserFilters(req, r?.episodes ?? []);
-      send(
+      sendItems(
         req,
         res,
         filterByType(eps, types ?? new Set(['episode'])).slice(
@@ -565,7 +591,7 @@ async function handleItems(
       return;
     }
     const seasons = (await seasonsForSeries(ctx, pd))?.seasons ?? [];
-    send(
+    sendItems(
       req,
       res,
       seasons.slice(startIndex, startIndex + limit),
@@ -579,7 +605,7 @@ async function handleItems(
       req,
       (await episodesForSeries(ctx, pd, pd.s))?.episodes ?? []
     );
-    send(
+    sendItems(
       req,
       res,
       eps.slice(startIndex, startIndex + limit),
@@ -620,11 +646,11 @@ async function handleItems(
         }
       );
       const items = await itemsFromPreviews(ctx, page.items, { parentId });
-      send(req, res, applySort(req, items), page.total, startIndex);
+      sendItems(req, res, applySort(req, items), page.total, startIndex);
       return;
     }
     if (pd.k === 'part') {
-      send(req, res, [], 0, startIndex);
+      sendItems(req, res, [], 0, startIndex);
       return;
     }
     const r = await boxSetChildren(ctx, pd);
@@ -632,7 +658,7 @@ async function handleItems(
       req,
       filterByType(applyUserFilters(req, r?.children ?? []), types)
     );
-    send(
+    sendItems(
       req,
       res,
       applySort(req, children.slice(startIndex, startIndex + limit)),
@@ -664,14 +690,14 @@ async function handleItems(
         limit,
       });
       const items = await itemsFromPreviews(ctx, page.previews);
-      send(req, res, excludeTypes(req, items), page.total, startIndex);
+      sendItems(req, res, excludeTypes(req, items), page.total, startIndex);
       return;
     }
     // Without TMDB, a search for the name finds what it can.
     const name = person?.n;
     const previews = name ? await searchCatalogs(engine, name, limit) : [];
     const items = filterByType(await itemsFromPreviews(ctx, previews), types);
-    send(req, res, items, items.length, 0);
+    sendItems(req, res, items, items.length, 0);
     return;
   }
 
@@ -697,7 +723,7 @@ async function handleItems(
     );
     const pageEnd =
       startIndex + Math.min(Math.max(1, qi(req, 'Limit', 500)), 500);
-    send(req, res, items.slice(startIndex, pageEnd), items.length, startIndex);
+    sendItems(req, res, items.slice(startIndex, pageEnd), items.length, startIndex);
     return;
   }
 
@@ -719,7 +745,7 @@ async function handleItems(
         : await provider.listPlayed(ctx.watch, kinds);
     const sorted = await sortRows(req, ctx, rows, types);
     if ('items' in sorted) {
-      send(
+      sendItems(
         req,
         res,
         sorted.items.slice(startIndex, startIndex + limit),
@@ -735,7 +761,7 @@ async function handleItems(
         types
       )
     );
-    send(
+    sendItems(
       req,
       res,
       items.slice(startIndex, startIndex + limit),
@@ -772,7 +798,7 @@ async function handleItems(
       !catalogCanList(types) ||
       (requiresGenre(catalog) && !genreFromId && !searchTerm)
     ) {
-      send(req, res, [], 0, startIndex);
+      sendItems(req, res, [], 0, startIndex);
       return;
     }
     if (searchTerm && !supportsExtra(catalog, 'search')) {
@@ -788,7 +814,7 @@ async function handleItems(
         ctx.userData
       );
       const items = filterByType(await itemsFromPreviews(ctx, previews), types);
-      send(
+      sendItems(
         req,
         res,
         items.slice(startIndex, startIndex + limit),
@@ -811,7 +837,7 @@ async function handleItems(
       parentId,
       catalog,
     });
-    send(req, res, applySort(req, items), page.total, startIndex);
+    sendItems(req, res, applySort(req, items), page.total, startIndex);
     return;
   }
 
@@ -836,7 +862,7 @@ async function handleItems(
       ...people,
       ...(await channelListItems(ctx, channels)),
     ];
-    send(
+    sendItems(
       req,
       res,
       items.slice(startIndex, startIndex + limit),
@@ -848,18 +874,18 @@ async function handleItems(
 
   if (!parentId && !recursive) {
     const views = await userViews(ctx);
-    send(req, res, views, views.length);
+    sendItems(req, res, views, views.length);
     return;
   }
 
   /* A parent that resolved to nothing browsable holds nothing. */
   if (parentId) {
-    send(req, res, [], 0, startIndex);
+    sendItems(req, res, [], 0, startIndex);
     return;
   }
   /* a crawl with no parent gets the first page of each library, never a walk */
   if (!catalogCanList(types)) {
-    send(req, res, [], 0, startIndex);
+    sendItems(req, res, [], 0, startIndex);
     return;
   }
   const views = withoutRequiredGenre(
@@ -895,7 +921,7 @@ async function handleItems(
       offset++;
     }
   }
-  send(req, res, items, more ? want + limit : offset, startIndex);
+  sendItems(req, res, items, more ? want + limit : offset, startIndex);
 }
 
 router.get(['/Items', '/Users/:userId/Items'], jf(handleItems));
