@@ -1038,7 +1038,36 @@ async function handleItems(
   sendItems(req, res, items, more ? want + limit : offset, startIndex);
 }
 
-router.get(['/Items', '/Users/:userId/Items'], jf(handleItems));
+// Diagnostic-only wrapper: report slow library requests without logging credentials.
+router.get(
+  ['/Items', '/Users/:userId/Items'],
+  jf(async (req, res, ctx) => {
+    const started = Date.now();
+    const requestInfo = {
+      types: qlist(req, 'IncludeItemTypes').join(','),
+      recursive: qb(req, 'Recursive') ?? false,
+      hasParent: !!qs(req, 'ParentId'),
+      startIndex: qi(req, 'StartIndex', 0),
+      limit: qi(req, 'Limit', 0),
+    };
+    let completed = false;
+    try {
+      await handleItems(req, res, ctx);
+      completed = true;
+    } finally {
+      const durationMs = Date.now() - started;
+      if (durationMs >= 5000 || !completed) {
+        console.info('[infuse-index-diagnostic]', JSON.stringify({
+          ...requestInfo,
+          durationMs,
+          completed,
+          clientDisconnected: req.destroyed,
+          responseSent: res.headersSent,
+        }));
+      }
+    }
+  })
+);
 
 router.get(
   ['/Items/Latest', '/Users/:userId/Items/Latest'],
