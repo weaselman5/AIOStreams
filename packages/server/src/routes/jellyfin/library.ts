@@ -651,6 +651,14 @@ async function handleItems(
       ? !!(await getMeta(ctx, pd.t, pd.i).catch(() => null))?.collection
       : false;
   if (pd?.k === 'series' && !collectionParent) {
+    // A recursive Season-only request must still return seasons. Previously
+    // `recursive` forced the episode path and filtered every result away.
+    if (types?.has('season') && !types.has('episode')) {
+      const seasons = (await seasonsForSeries(ctx, pd))?.seasons ?? [];
+      const filtered = excludeTypes(req, applyUserFilters(req, seasons));
+      sendItems(req, res, filtered.slice(startIndex, startIndex + limit), filtered.length, startIndex);
+      return;
+    }
     if (types?.has('episode') || recursive) {
       const r = await episodesForSeries(ctx, pd);
       const eps = applyUserFilters(req, r?.episodes ?? []);
