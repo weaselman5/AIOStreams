@@ -497,11 +497,11 @@ const tvIndex = new Map<string, {
 
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
-  catalog: { type: string; id: string; name: string },
+  catalog: Parameters<typeof getCatalogPage>[1],
   kind: 'season' | 'episode',
   genre?: string
 ): Promise<JellyfinItem[]> {
-  const key = [ctx.scope(), catalog.type, catalog.id, kind, genre ?? ''].join('|');
+  const key = [ctx.scope(), JSON.stringify(catalog), kind, genre ?? ''].join('|');
   const now = Date.now();
   const hit = tvIndex.get(key);
   if (hit && hit.expires > now) return hit.result;
