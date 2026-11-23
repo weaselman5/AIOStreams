@@ -518,8 +518,13 @@ async function tvLibraryIndex(
       const episodes: JellyfinItem[] = [];
       const seenSeasons = new Set<string>();
       const seenEpisodes = new Set<string>();
-      const batchSize = 100;
-      for (let offset = 0; ; offset += batchSize) {
+      // Safety limit for the Infuse integration test: never expand thousands
+      // of series in a single HTTP request. This intentionally indexes only
+      // the first 24 shows and must not be treated as a complete TV library.
+      const batchSize = 24;
+      const maxSeries = 24;
+      let scannedSeries = 0;
+      for (let offset = 0; scannedSeries < maxSeries; offset += batchSize) {
         const page = await getCatalogPage(engine, catalog, {
           startIndex: offset,
           limit: batchSize,
@@ -527,8 +532,9 @@ async function tvLibraryIndex(
           exactTotal: false,
         });
         if (!page.items.length) break;
-        const series = page.items.filter((p) => p.type === 'series');
-        const expanded = await mapLimited(series, ROW_CONCURRENCY, async (p) => {
+        const series = page.items.filter((p) => p.type === 'series').slice(0, maxSeries - scannedSeries);
+        scannedSeries += series.length;
+        const expanded = await mapLimited(series, 3, async (p) => {
           const d = { t: p.type, i: p.id };
           try {
             const seasonData = await seasonsForSeries(ctx, d);
