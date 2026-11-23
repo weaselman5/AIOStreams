@@ -985,19 +985,52 @@ async function handleItems(
  */
 const INDEX_MAX_ACTIVE = 1;
 let indexActive = 0;
-const indexWaiters: Array<() => void> = [];
-async function withIndexSlot<T>(fn: () => Promise<T>): Promise<T> {
+type IndexWaiter = { resolve: () => void; reject: (error: Error) => void; signal: AbortSignal; onAbort: () => void };
+const indexWaiters: IndexWaiter[] = [];
+const indexAbortError = () => new Error('Infuse indexing request disconnected');
+function indexMemory() {
+  const m = process.memoryUsage();
+  const mb = (bytes: number) => Math.round(bytes / 1048576);
+  return { heapUsedMB: mb(m.heapUsed), heapTotalMB: mb(m.heapTotal), rssMB: mb(m.rss), externalMB: mb(m.external), active: indexActive, queued: indexWaiters.length };
+}
+async function withIndexSlot<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T | undefined> {
+  if (signal.aborted) return undefined;
   if (indexActive >= INDEX_MAX_ACTIVE) {
-    await new Promise<void>((resolve) => indexWaiters.push(resolve));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const waiter: IndexWaiter = {
+          resolve, reject, signal,
+          onAbort: () => {
+            const index = indexWaiters.indexOf(waiter);
+            if (index >= 0) indexWaiters.splice(index, 1);
+            reject(indexAbortError());
+          },
+        };
+        indexWaiters.push(waiter);
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+        if (signal.aborted) waiter.onAbort();
+      });
+    } catch {
+      return undefined;
+    }
   } else {
     indexActive++;
   }
   try {
+    if (signal.aborted) return undefined;
     return await fn();
   } finally {
-    const next = indexWaiters.shift();
-    if (next) next();
-    else indexActive--;
+    let next: IndexWaiter | undefined;
+    while ((next = indexWaiters.shift())) {
+      next.signal.removeEventListener('abort', next.onAbort);
+      if (next.signal.aborted) {
+        next.reject(indexAbortError());
+        continue;
+      }
+      next.resolve();
+      break;
+    }
+    if (!next) indexActive--;
   }
 }
 
@@ -1013,10 +1046,15 @@ router.get(
       startIndex: qi(req, 'StartIndex', 0),
       limit: qi(req, 'Limit', 0),
     };
+    const signal = untilClosed(res);
     let completed = false;
+    const before = indexMemory();
     try {
-      await withIndexSlot(() => handleItems(req, res, ctx));
-      completed = true;
+      const result = await withIndexSlot(signal, async () => {
+        if (signal.aborted) return;
+        await handleItems(req, res, ctx);
+      });
+      completed = !signal.aborted && result === undefined && res.headersSent;
     } finally {
       const durationMs = Date.now() - started;
       if (durationMs >= 5000 || !completed) {
@@ -1026,6 +1064,8 @@ router.get(
           completed,
           clientDisconnected: req.destroyed,
           responseSent: res.headersSent,
+          before,
+          after: indexMemory(),
         }));
       }
     }
