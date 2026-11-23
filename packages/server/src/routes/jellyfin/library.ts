@@ -488,8 +488,8 @@ router.get(
  * Share an in-flight scan between concurrent requests and retain the resulting
  * snapshot briefly so subsequent StartIndex pages see the same ordering/total.
  */
-const TV_INDEX_TTL_MS = 10 * 60_000;
-const TV_INDEX_MAX_ENTRIES = 6;
+const TV_INDEX_TTL_MS = 60_000;
+const TV_INDEX_MAX_ENTRIES = 2;
 type TvSnapshot = { seasons: JellyfinItem[]; episodes: JellyfinItem[] };
 const tvIndex = new Map<string, {
   expires: number;
@@ -1038,6 +1038,29 @@ async function handleItems(
   sendItems(req, res, items, more ? want + limit : offset, startIndex);
 }
 
+/**
+ * Bound concurrent Infuse library scans across all clients. Infuse can request
+ * many 200-item pages alongside recursive season scans; without backpressure
+ * those requests compete for the same small Node heap.
+ */
+const INDEX_MAX_ACTIVE = 2;
+let indexActive = 0;
+const indexWaiters: Array<() => void> = [];
+async function withIndexSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (indexActive >= INDEX_MAX_ACTIVE) {
+    await new Promise<void>((resolve) => indexWaiters.push(resolve));
+  } else {
+    indexActive++;
+  }
+  try {
+    return await fn();
+  } finally {
+    const next = indexWaiters.shift();
+    if (next) next();
+    else indexActive--;
+  }
+}
+
 // Diagnostic-only wrapper: report slow library requests without logging credentials.
 router.get(
   ['/Items', '/Users/:userId/Items'],
@@ -1052,7 +1075,7 @@ router.get(
     };
     let completed = false;
     try {
-      await handleItems(req, res, ctx);
+      await withIndexSlot(() => handleItems(req, res, ctx));
       completed = true;
     } finally {
       const durationMs = Date.now() - started;
