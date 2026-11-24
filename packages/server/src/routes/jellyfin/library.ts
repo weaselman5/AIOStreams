@@ -582,29 +582,76 @@ async function buildTvIndex(
 
 const tvJobs = new Map<string, Promise<void>>();
 let tvJobTail: Promise<void> = Promise.resolve();
+type TvCatalog = Parameters<typeof getCatalogPage>[1];
+type TvKind = 'season' | 'episode';
+function tvScope(ctx: JellyfinRequestContext, catalog: TvCatalog, genre?: string): string {
+  return createHash('sha256').update(JSON.stringify([
+    ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
+  ])).digest('hex');
+}
+function tvReady(scope: string, kind: TvKind): boolean {
+  const state = openTvIndex().prepare('SELECT complete, updated FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind);
+  return Boolean(state?.complete);
+}
+function queueTvIndex(ctx: JellyfinRequestContext, catalog: TvCatalog, kind: TvKind, genre?: string): Promise<void> {
+  const scope = tvScope(ctx, catalog, genre);
+  const key = scope + ':' + kind;
+  if (tvReady(scope, kind)) return Promise.resolve();
+  const existing = tvJobs.get(key);
+  if (existing) return existing;
+  const job = tvJobTail.then(() => buildTvIndex(ctx, catalog, kind, genre, scope))
+    .catch(error => { console.warn('[infuse-tv-index] failed', JSON.stringify({scope, kind, message: String(error?.message ?? 'unknown')})); })
+    .finally(() => { tvJobs.delete(key); ctx.metas.clear(); });
+  tvJobs.set(key, job);
+  tvJobTail = job;
+  console.info('[infuse-tv-index] queued', JSON.stringify({scope, kind, pending: tvJobs.size}));
+  return job;
+}
+const tvWarmups = new Map<string, Promise<void>>();
+function warmTvLibrary(ctx: JellyfinRequestContext): void {
+  const key = JSON.stringify([ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name]);
+  if (tvWarmups.has(key)) return;
+  const task = (async () => {
+    const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
+    const targets: {catalog: TvCatalog; genre?: string; kind: TvKind}[] = [];
+    const seen = new Set<string>();
+    for (const view of views) {
+      const catalog = view.catalog;
+      const genres: (string | undefined)[] = requiresGenre(catalog) ? genreOptions(catalog) : [undefined];
+      for (const genre of genres) {
+        for (const kind of ['season', 'episode'] as const) {
+          const id = tvScope(ctx, catalog, genre) + ':' + kind;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          targets.push({catalog, genre, kind});
+        }
+      }
+    }
+    console.info('[infuse-tv-index] warmup started', JSON.stringify({jobs: targets.length}));
+    let done = 0;
+    for (const target of targets) {
+      await queueTvIndex(ctx, target.catalog, target.kind, target.genre);
+      if (tvReady(tvScope(ctx, target.catalog, target.genre), target.kind)) done++;
+      console.info('[infuse-tv-index] warmup progress', JSON.stringify({done, total: targets.length}));
+    }
+    console.info('[infuse-tv-index] warmup finished', JSON.stringify({done, total: targets.length, ready: done === targets.length}));
+  })().catch(error => { console.warn('[infuse-tv-index] warmup failed', String(error?.message ?? error)); })
+    .finally(() => { tvWarmups.delete(key); ctx.metas.clear(); });
+  tvWarmups.set(key, task);
+}
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
-  catalog: Parameters<typeof getCatalogPage>[1],
-  kind: 'season' | 'episode',
+  catalog: TvCatalog,
+  kind: TvKind,
   genre: string | undefined,
   startIndex: number,
   limit: number
 ): Promise<{ items: JellyfinItem[]; total: number } | null> {
   const db = openTvIndex();
-  const scope = createHash('sha256').update(JSON.stringify([
-    ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
-  ])).digest('hex');
-  const state = db.prepare('SELECT complete, updated FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind);
-  if (!state?.complete || Date.now() - Number(state.updated) > 24 * 3600 * 1000) {
-    const key = scope + ':' + kind;
-    if (!tvJobs.has(key)) {
-      const job = tvJobTail.then(() => buildTvIndex(ctx, catalog, kind, genre, scope))
-        .catch(error => { console.warn('[infuse-tv-index] failed', JSON.stringify({scope, kind, message: String(error?.message ?? 'unknown')})); })
-        .finally(() => { tvJobs.delete(key); ctx.metas.clear(); });
-      tvJobs.set(key, job);
-      tvJobTail = job;
-      console.info('[infuse-tv-index] queued', JSON.stringify({scope, kind, pending: tvJobs.size}));
-    }
+  const scope = tvScope(ctx, catalog, genre);
+  warmTvLibrary(ctx);
+  if (!tvReady(scope, kind)) {
+    void queueTvIndex(ctx, catalog, kind, genre);
     return null;
   }
   const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
