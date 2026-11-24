@@ -1020,6 +1020,13 @@ async function handleItems(
           if (!ep.SeriesId || !ep.SeriesName) continue;
           const id = String(row.series).slice('series:'.length);
           const item = buildContentItem(ctx.build, { type: 'series', id, name: String(ep.SeriesName) } as MetaPreview);
+          const primary = typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
+            ? ep.SeriesPrimaryImageTag
+            : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
+          if (primary) item.ImageTags = { ...item.ImageTags, Primary: primary };
+          if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
+            item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
+          }
           items.push({ ...item, Id: String(ep.SeriesId), ParentId: parentId, Type: 'Series', IsFolder: true });
         }
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
@@ -1195,6 +1202,13 @@ async function handleItems(
           if (!ep.SeriesId || !ep.SeriesName) continue;
           const id = String(row.series).slice('series:'.length);
           const item = buildContentItem(ctx.build, { type: 'series', id, name: String(ep.SeriesName) } as MetaPreview);
+          const primary = typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
+            ? ep.SeriesPrimaryImageTag
+            : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
+          if (primary) item.ImageTags = { ...item.ImageTags, Primary: primary };
+          if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
+            item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
+          }
           items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
         }
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
