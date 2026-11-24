@@ -1128,6 +1128,40 @@ async function handleItems(
     sendItems(req, res, excludeTypes(req, applyUserFilters(req, items)), total, startIndex);
     return;
   }
+  // Enumerate existing indexed parent series without additional metadata requests.
+  if (/infuse/i.test(ctx.client.name) && recursive && types?.size === 1 &&
+      types.has('series') && !searchTerm && !genre && !genreIds.length &&
+      !filters.length && !wantsFavorites && !wantsPlayed && !wantsResumable) {
+    const db = openTvIndex();
+    const owner = tvOwner(ctx);
+    const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
+    const scopes = [...new Set(views.flatMap(view =>
+      (requiresGenre(view.catalog) ? genreOptions(view.catalog) : [undefined])
+        .map(g => tvScope(ctx, view.catalog, g))))];
+    if (scopes.length) {
+      const placeholders = scopes.map(() => '?').join(',');
+      const from = ' FROM tv_series m JOIN tv_rows r ON r.kind=m.kind AND r.id=m.id WHERE m.owner=? AND m.kind=\'episode\' AND r.scope IN (' + placeholders + ')';
+      const total = Number(db.prepare('SELECT COUNT(DISTINCT m.series) AS n' + from).get(owner, ...scopes)?.n ?? 0);
+      if (total > 0) {
+        const rows = db.prepare('SELECT m.series, MIN(m.id) AS id' + from +
+          ' GROUP BY m.series ORDER BY m.series LIMIT ? OFFSET ?').all(owner, ...scopes, limit, startIndex);
+        const payload = db.prepare("SELECT payload FROM tv_payloads WHERE owner=? AND kind='episode' AND id=?");
+        const items: JellyfinItem[] = [];
+        for (const row of rows) {
+          const stored = payload.get(owner, String(row.id));
+          if (!stored) continue;
+          const ep = JSON.parse(inflateRawSync(stored.payload as Uint8Array).toString('utf8')) as JellyfinItem;
+          if (!ep.SeriesId || !ep.SeriesName) continue;
+          const id = String(row.series).slice('series:'.length);
+          const item = buildContentItem(ctx.build, { type: 'series', id, name: String(ep.SeriesName) } as MetaPreview);
+          items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
+        }
+        console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
+        sendItems(req, res, items, total, startIndex);
+        return;
+      }
+    }
+  }
   /* a crawl with no parent gets the first page of each library, never a walk */
   if (!catalogCanList(types)) {
     sendItems(req, res, [], 0, startIndex);
