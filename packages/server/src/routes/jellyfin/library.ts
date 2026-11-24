@@ -514,8 +514,10 @@ function openTvIndex(): DatabaseSync {
   }
   const db = new DatabaseSync('./data/infuse-tv-index-v2.sqlite');
   db.exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
+    CREATE TABLE IF NOT EXISTS tv_artwork (owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(owner,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_payloads (owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,kind,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_series (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(owner,kind,series,ordinal)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS tv_series_art_lookup ON tv_series(owner,kind,id);
     CREATE TABLE IF NOT EXISTS tv_series_done (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, PRIMARY KEY(owner,kind,series)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_rows (
       scope TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
@@ -581,6 +583,7 @@ async function buildTvIndex(
             console.warn('[infuse-tv-index] metadata unavailable; skipping', JSON.stringify({kind, id: preview.id}));
             continue;
           }
+          saveSeriesArt(ctx, built.seriesItem);
           const items = 'seasons' in built ? built.seasons : built.episodes;
           db.exec('BEGIN');
           try {
@@ -701,22 +704,63 @@ async function tvLibraryIndex(
   const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
   console.info('[infuse-tv-index] page ready', JSON.stringify({scope, kind, startIndex, limit, total, complete: tvReady(scope, kind)}));
   const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
-  return {items: rows.map(row => inspectIndexedEpisodeArtwork(JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem)), total};
+  return {items: await restoreIndexedArtwork(ctx, rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem)), total};
 }
 
-// Compare a small set of indexed episode records without changing their payloads.
-const artworkEpisodeSamples = new Set<string>();
-function inspectIndexedEpisodeArtwork(item: JellyfinItem) {
-  const name = String(item.SeriesName ?? '').trim().toLowerCase();
-  if (!['adults', 'the altruists', 'lucky'].includes(name)) return item;
-  if (artworkEpisodeSamples.has(name)) return item;
-  artworkEpisodeSamples.add(name);
-  const fields = Object.fromEntries(Object.entries(item).filter(([key]) =>
-    /image|artwork|provider|series|parent/i.test(key)));
-  console.info('[infuse-artwork-diagnostic]', JSON.stringify({
-    stage: 'indexed-episode', name, id: item.Id, fields
+// Persist original parent artwork independently of the episode index.
+function saveSeriesArt(ctx: JellyfinRequestContext, item: JellyfinItem, id = String(item.Id)) {
+  if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) return;
+  openTvIndex().prepare('INSERT OR REPLACE INTO tv_artwork VALUES (?, ?, ?)').run(tvOwner(ctx), id, JSON.stringify({
+    ImageTags: item.ImageTags, BackdropImageTags: item.BackdropImageTags,
+    ProviderIds: item.ProviderIds, PrimaryImageAspectRatio: item.PrimaryImageAspectRatio || 0.6666
   }));
-  return item;
+}
+async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sourceId?: string): Promise<Partial<JellyfinItem>> {
+  const id = String(ep.SeriesId ?? '');
+  if (!id) return {};
+  const db = openTvIndex();
+  const saved = db.prepare('SELECT payload FROM tv_artwork WHERE owner=? AND id=?').get(tvOwner(ctx), id);
+  if (saved) return JSON.parse(String(saved.payload)) as Partial<JellyfinItem>;
+  const remembered = await recallImages(id.replace(/-/g, '').toLowerCase());
+  const poster = pickImage(remembered, 'Primary');
+  const backdrop = pickImage(remembered, 'Backdrop');
+  const inherited = typeof ep.SeriesPrimaryImageTag === 'string' ? ep.SeriesPrimaryImageTag : undefined;
+  const primary = poster ? encodeImageTag(poster) : inherited;
+  if (primary) {
+    const art = {ImageTags: {Primary: primary}, BackdropImageTags: backdrop ? [encodeImageTag(backdrop)] : ep.ParentBackdropImageTags, PrimaryImageAspectRatio: 0.6666};
+    return art;
+  }
+  const row = sourceId ? undefined : db.prepare("SELECT series FROM tv_series WHERE owner=? AND kind=? AND id=? LIMIT 1").get(tvOwner(ctx), String(ep.Type).toLowerCase(), String(ep.Id));
+  const base = sourceId ?? (row ? String(row.series).slice('series:'.length) : '');
+  if (!base) return {};
+  try {
+    const meta = await getMeta(ctx, 'series', base);
+    if (meta) {
+      const original = buildContentItem(ctx.build, {...meta, id: base, type: 'series'});
+      saveSeriesArt(ctx, original, id);
+      return {ImageTags: original.ImageTags, BackdropImageTags: original.BackdropImageTags, ProviderIds: original.ProviderIds, PrimaryImageAspectRatio: original.PrimaryImageAspectRatio || 0.6666};
+    }
+  } catch { /* preserve the indexed item on metadata failure */ }
+  if (/^tt\d+$/.test(base)) return {ImageTags: {Primary: encodeImageTag(metahubPoster(base))}, PrimaryImageAspectRatio: 0.6666};
+  return {};
+}
+async function restoreIndexedArtwork(ctx: JellyfinRequestContext, items: JellyfinItem[]): Promise<JellyfinItem[]> {
+  if (!/infuse/i.test(ctx.client.name)) return items;
+  const parents = new Map<string, JellyfinItem>();
+  for (const item of items) if (item.SeriesId && !parents.has(String(item.SeriesId))) parents.set(String(item.SeriesId), item);
+  const art = new Map<string, Partial<JellyfinItem>>();
+  await mapLimited([...parents.entries()], 4, async ([id, item]) => {
+    art.set(id, await parentArtwork(ctx, item).catch(() => ({})));
+  });
+  ctx.metas.clear();
+  return items.map(item => {
+    const parent = art.get(String(item.SeriesId));
+    const tags = parent?.ImageTags as Record<string, string> | undefined;
+    if (!tags?.Primary) return item;
+    return {...item, SeriesPrimaryImageTag: tags.Primary,
+      ...(parent?.BackdropImageTags ? {ParentBackdropItemId: item.SeriesId, ParentBackdropImageTags: parent.BackdropImageTags} : {}),
+      ...(tags.Logo ? {ParentLogoItemId: item.SeriesId, ParentLogoImageTag: tags.Logo} : {})};
+  });
 }
 
 async function handleItems(
@@ -1036,48 +1080,8 @@ async function handleItems(
           const ep = JSON.parse(inflateRawSync(stored.payload as Uint8Array).toString('utf8')) as JellyfinItem;
           if (!ep.SeriesId || !ep.SeriesName) continue;
           const id = String(row.series).slice('series:'.length);
-          const remembered = await recallImages(String(ep.SeriesId).replace(/-/g, '').toLowerCase());
-          const poster = pickImage(remembered, 'Primary');
-          const background = pickImage(remembered, 'Backdrop');
-          const item = buildContentItem(ctx.build, { type: 'series', id, name: String(ep.SeriesName), ...(poster ? { poster } : {}), ...(background ? { background } : {}) } as MetaPreview);
-          const primary = poster ? encodeImageTag(poster) : typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
-            ? ep.SeriesPrimaryImageTag
-            : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
-          if (primary) item.ImageTags = { ...(item.ImageTags as Record<string, string> | undefined), Primary: primary };
-          if (background) item.BackdropImageTags = [encodeImageTag(background)];
-          else if (/^tt\d+$/.test(id) && !(item.BackdropImageTags as string[] | undefined)?.length) {
-            item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
-          }
-          // Resolve original series metadata only when the indexed poster is missing.
-          // Keep requests sequential and use the existing metadata cache.
-          const artworkFallback = !(item.ImageTags as Record<string, string> | undefined)?.Primary;
-          if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) {
-            try {
-              const meta = await getMeta(ctx, 'series', id);
-              if (meta) {
-                const original = buildContentItem(ctx.build, { ...meta, id, type: 'series' });
-                item.ImageTags = original.ImageTags;
-                item.BackdropImageTags = original.BackdropImageTags;
-                item.ProviderIds = original.ProviderIds;
-                item.PrimaryImageAspectRatio = original.PrimaryImageAspectRatio;
-              }
-            } catch {
-              // A metadata failure must not remove a series from the library.
-            } finally {
-              ctx.metas.clear();
-            }
-          }
-          if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
-            item.PrimaryImageAspectRatio = 0.6666;
-          }
-          if (String(ep.SeriesName).trim().toLowerCase() === 'adults') {
-            console.info('[infuse-artwork-diagnostic]', JSON.stringify({
-              stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
-              tags: item.ImageTags, backdrops: item.BackdropImageTags,
-              aspect: item.PrimaryImageAspectRatio, episodePoster: ep.SeriesPrimaryImageTag,
-              providerIds: item.ProviderIds
-            }));
-          }
+          const art = await parentArtwork(ctx, ep, id).catch(() => ({}));
+          const item = {...buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview), ...art};
           items.push({ ...item, Id: String(ep.SeriesId), ParentId: parentId, Type: 'Series', IsFolder: true });
         }
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
@@ -1223,7 +1227,7 @@ async function handleItems(
     const rows = db.prepare('SELECT p.payload FROM (SELECT DISTINCT r.id' + where +
       ' ORDER BY r.id LIMIT ? OFFSET ?) ids JOIN tv_payloads p ON p.id=ids.id AND p.owner=? AND p.kind=? ORDER BY ids.id')
       .all(kind, ...scopes, pageLimit, startIndex, tvOwner(ctx), kind);
-    const items = rows.map(row => inspectIndexedEpisodeArtwork(JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem));
+    const items = await restoreIndexedArtwork(ctx, rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem));
     sendItems(req, res, excludeTypes(req, applyUserFilters(req, items)), total, startIndex);
     return;
   }
@@ -1252,48 +1256,8 @@ async function handleItems(
           const ep = JSON.parse(inflateRawSync(stored.payload as Uint8Array).toString('utf8')) as JellyfinItem;
           if (!ep.SeriesId || !ep.SeriesName) continue;
           const id = String(row.series).slice('series:'.length);
-          const remembered = await recallImages(String(ep.SeriesId).replace(/-/g, '').toLowerCase());
-          const poster = pickImage(remembered, 'Primary');
-          const background = pickImage(remembered, 'Backdrop');
-          const item = buildContentItem(ctx.build, { type: 'series', id, name: String(ep.SeriesName), ...(poster ? { poster } : {}), ...(background ? { background } : {}) } as MetaPreview);
-          const primary = poster ? encodeImageTag(poster) : typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
-            ? ep.SeriesPrimaryImageTag
-            : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
-          if (primary) item.ImageTags = { ...(item.ImageTags as Record<string, string> | undefined), Primary: primary };
-          if (background) item.BackdropImageTags = [encodeImageTag(background)];
-          else if (/^tt\d+$/.test(id) && !(item.BackdropImageTags as string[] | undefined)?.length) {
-            item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
-          }
-          // Resolve original series metadata only when the indexed poster is missing.
-          // Keep requests sequential and use the existing metadata cache.
-          const artworkFallback = !(item.ImageTags as Record<string, string> | undefined)?.Primary;
-          if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) {
-            try {
-              const meta = await getMeta(ctx, 'series', id);
-              if (meta) {
-                const original = buildContentItem(ctx.build, { ...meta, id, type: 'series' });
-                item.ImageTags = original.ImageTags;
-                item.BackdropImageTags = original.BackdropImageTags;
-                item.ProviderIds = original.ProviderIds;
-                item.PrimaryImageAspectRatio = original.PrimaryImageAspectRatio;
-              }
-            } catch {
-              // A metadata failure must not remove a series from the library.
-            } finally {
-              ctx.metas.clear();
-            }
-          }
-          if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
-            item.PrimaryImageAspectRatio = 0.6666;
-          }
-          if (String(ep.SeriesName).trim().toLowerCase() === 'adults') {
-            console.info('[infuse-artwork-diagnostic]', JSON.stringify({
-              stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
-              tags: item.ImageTags, backdrops: item.BackdropImageTags,
-              aspect: item.PrimaryImageAspectRatio, episodePoster: ep.SeriesPrimaryImageTag,
-              providerIds: item.ProviderIds
-            }));
-          }
+          const art = await parentArtwork(ctx, ep, id).catch(() => ({}));
+          const item = {...buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview), ...art};
           items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
         }
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
