@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, statfsSync, statSync, renameSync } from 'node:fs';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { Router, type Request, type Response } from 'express';
 import {
@@ -512,11 +512,57 @@ function openTvIndex(): DatabaseSync {
   for (const suffix of ['-wal', '-shm', '-journal', '']) {
     rmSync('./data/infuse-tv-index.sqlite' + suffix, { force: true });
   }
-  const db = new DatabaseSync('./data/infuse-tv-index-v2.sqlite');
-  db.exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
+  const legacyPath = './data/infuse-tv-index-v2.sqlite';
+  const compactPath = './data/infuse-tv-index-v3.sqlite';
+  const stagingPath = compactPath + '.building';
+  let indexPath = compactPath;
+  if (existsSync(legacyPath) && !existsSync(compactPath)) {
+    // Never remove the only persistent copy. Migration needs room for both files.
+    const fs = statfsSync('./data');
+    const available = fs.bavail * fs.bsize;
+    const required = Math.ceil(statSync(legacyPath).size * 0.65);
+    if (available < required) {
+      console.warn('[infuse-tv-index] compact migration deferred: insufficient free volume space', JSON.stringify({available,required}));
+      indexPath = legacyPath;
+    } else {
+      rmSync(stagingPath, {force:true});
+      const staged = new DatabaseSync(stagingPath);
+      try {
+        staged.exec('PRAGMA page_size=16384; PRAGMA journal_mode=DELETE; PRAGMA cache_size=-8192;');
+        staged.prepare('ATTACH DATABASE ? AS legacy').run(legacyPath);
+        const tables = staged.prepare("SELECT name,sql FROM legacy.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
+        staged.exec('BEGIN');
+        for (const table of tables) {
+          const name = String(table.name);
+          if (!/^tv_[a-z_]+$/.test(name)) throw new Error('Unexpected index table');
+          let ddl = String(table.sql);
+          if (name === 'tv_payloads') ddl = ddl.replace(/ WITHOUT ROWID/i,'');
+          staged.exec(ddl);
+          staged.exec('INSERT INTO main.'+name+' SELECT * FROM legacy.'+name);
+          const counts = staged.prepare('SELECT (SELECT COUNT(*) FROM main.'+name+') AS copied,(SELECT COUNT(*) FROM legacy.'+name+') AS original').get();
+          if (counts?.copied !== counts?.original) throw new Error('Index migration count mismatch: '+name);
+        }
+        for (const row of staged.prepare("SELECT sql FROM legacy.sqlite_schema WHERE type='index' AND sql IS NOT NULL").all()) staged.exec(String(row.sql));
+        staged.exec('COMMIT');
+        const check = staged.prepare('PRAGMA main.quick_check').get();
+        if (Object.values(check ?? {})[0] !== 'ok') throw new Error('Compact index integrity check failed');
+        staged.close();
+        renameSync(stagingPath,compactPath);
+        console.info('[infuse-tv-index] compact migration verified; legacy retained', JSON.stringify({bytes:statSync(compactPath).size}));
+      } catch (error) {
+        try { if (staged.isTransaction) staged.exec('ROLLBACK'); staged.close(); } catch {}
+        rmSync(stagingPath,{force:true});
+        rmSync(stagingPath+'-journal',{force:true});
+        console.warn('[infuse-tv-index] compact migration deferred',String(error));
+        indexPath=legacyPath;
+      }
+    }
+  }
+  const db = new DatabaseSync(indexPath);
+  db.exec(`PRAGMA page_size=16384; PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
     CREATE TABLE IF NOT EXISTS tv_original_series (owner TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_artwork (owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(owner,id)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS tv_payloads (owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,kind,id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS tv_payloads (owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,kind,id));
     CREATE TABLE IF NOT EXISTS tv_series (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(owner,kind,series,ordinal)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS tv_series_art_lookup ON tv_series(owner,kind,id);
     CREATE TABLE IF NOT EXISTS tv_series_done (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, PRIMARY KEY(owner,kind,series)) WITHOUT ROWID;
@@ -543,6 +589,10 @@ async function buildTvIndex(
   scope: string
 ): Promise<void> {
   const db = openTvIndex();
+  const free = statfsSync('./data');
+  if (free.bavail * free.bsize < 256 * 1024 * 1024) {
+    throw new Error('TV indexing paused: persistent volume has less than 256 MiB free');
+  }
   const engine = await ctx.engine();
   const progress = db.prepare('SELECT offset, complete, updated FROM tv_progress WHERE scope=? AND kind=?');
   const save = db.prepare('INSERT OR REPLACE INTO tv_progress VALUES (?, ?, ?, ?, ?)');
@@ -725,7 +775,8 @@ function readSeriesArt(ctx: JellyfinRequestContext, id: string): Partial<Jellyfi
 function saveSeriesArt(ctx: JellyfinRequestContext, item: JellyfinItem, id = String(item.Id)) {
   const art = mergeSeriesArt(readSeriesArt(ctx,id), item);
   if (!(art.ImageTags as Record<string,string> | undefined)?.Primary) return;
-  openTvIndex().prepare('INSERT OR REPLACE INTO tv_artwork VALUES (?, ?, ?)').run(tvOwner(ctx), id, JSON.stringify(art));
+  const serialized = JSON.stringify(art);
+  openTvIndex().prepare('INSERT INTO tv_artwork VALUES (?, ?, ?) ON CONFLICT(owner,id) DO UPDATE SET payload=excluded.payload WHERE payload<>excluded.payload').run(tvOwner(ctx), id, serialized);
 }
 function consistentTvItem(ctx: JellyfinRequestContext, item: JellyfinItem): JellyfinItem {
   if (!/infuse/i.test(ctx.client.name)) return item;
@@ -762,7 +813,7 @@ async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sour
   const primary = poster ? encodeImageTag(poster) : inherited;
   if (primary) {
     const art = {ImageTags: {Primary: primary}, BackdropImageTags: backdrop ? [encodeImageTag(backdrop)] : ep.ParentBackdropImageTags, PrimaryImageAspectRatio: 0.6666};
-    saveSeriesArt(ctx, {...ep,...art} as JellyfinItem,id);
+    saveSeriesArt(ctx, art as JellyfinItem,id);
     return art;
   }
   const row = sourceId ? undefined : db.prepare("SELECT series FROM tv_series WHERE owner=? AND kind=? AND id=? LIMIT 1").get(tvOwner(ctx), String(ep.Type).toLowerCase(), String(ep.Id));
