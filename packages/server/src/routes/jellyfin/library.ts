@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { Router, type Request, type Response } from 'express';
 import {
   buildContentItem,
@@ -496,11 +497,18 @@ let tvIndexDb: DatabaseSync | undefined;
 function openTvIndex(): DatabaseSync {
   if (tvIndexDb) return tvIndexDb;
   mkdirSync('./data', { recursive: true });
-  const db = new DatabaseSync('./data/infuse-tv-index.sqlite');
-  db.exec(`PRAGMA journal_mode=WAL; PRAGMA cache_size=-4096;
+  // Discard only the obsolete, rebuildable sidecar, never db.sqlite.
+  for (const suffix of ['-wal', '-shm', '-journal', '']) {
+    rmSync('./data/infuse-tv-index.sqlite' + suffix, { force: true });
+  }
+  const db = new DatabaseSync('./data/infuse-tv-index-v2.sqlite');
+  db.exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
+    CREATE TABLE IF NOT EXISTS tv_payloads (owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,kind,id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS tv_series (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(owner,kind,series,ordinal)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS tv_series_done (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, PRIMARY KEY(owner,kind,series)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_rows (
       scope TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL, payload TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
       PRIMARY KEY(scope, kind, id)
     );
     CREATE INDEX IF NOT EXISTS tv_rows_order ON tv_rows(scope, kind, ordinal);
@@ -525,17 +533,10 @@ async function buildTvIndex(
   const progress = db.prepare('SELECT offset, complete, updated FROM tv_progress WHERE scope=? AND kind=?');
   const save = db.prepare('INSERT OR REPLACE INTO tv_progress VALUES (?, ?, ?, ?, ?)');
   const count = db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?');
-  const insert = db.prepare('INSERT OR IGNORE INTO tv_rows VALUES (?, ?, ?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO tv_rows VALUES (?, ?, ?, ?)');
+  const owner = tvOwner(ctx);
   let state = progress.get(scope, kind);
-  if (state && Date.now() - Number(state.updated) > 24 * 3600 * 1000) {
-    db.exec('BEGIN');
-    try {
-      db.prepare('DELETE FROM tv_rows WHERE scope=? AND kind=?').run(scope, kind);
-      db.prepare('DELETE FROM tv_progress WHERE scope=? AND kind=?').run(scope, kind);
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
-    state = undefined;
-  }
+
   let offset = Number(state?.offset ?? 0);
   let complete = Boolean(state?.complete);
   let total = Number(count.get(scope, kind)?.n ?? 0);
@@ -550,23 +551,45 @@ async function buildTvIndex(
     for (const preview of page.items) {
       if (preview.type !== 'series') continue;
       try {
-        const descriptor = { t: preview.type, i: preview.id };
-        const built = kind === 'season'
-          ? await seasonsForSeries(ctx, descriptor)
-          : await episodesForSeries(ctx, descriptor);
-        if (!built) {
-          console.warn('[infuse-tv-index] metadata unavailable; skipping', JSON.stringify({kind, id: preview.id}));
-          continue;
+        const series = preview.type + ':' + preview.id;
+        const cached = db.prepare('SELECT 1 FROM tv_series_done WHERE owner=? AND kind=? AND series=?').get(owner, kind, series);
+        if (!cached) {
+          const descriptor = { t: preview.type, i: preview.id };
+          const built = kind === 'season'
+            ? await seasonsForSeries(ctx, descriptor)
+            : await episodesForSeries(ctx, descriptor);
+          if (!built) {
+            console.warn('[infuse-tv-index] metadata unavailable; skipping', JSON.stringify({kind, id: preview.id}));
+            continue;
+          }
+          const items = 'seasons' in built ? built.seasons : built.episodes;
+          db.exec('BEGIN');
+          try {
+            const payload = db.prepare('INSERT OR IGNORE INTO tv_payloads VALUES (?, ?, ?, ?)');
+            const member = db.prepare('INSERT OR IGNORE INTO tv_series VALUES (?, ?, ?, ?, ?)');
+            for (const [ordinal, item] of items.entries()) {
+              payload.run(owner, kind, String(item.Id), deflateRawSync(JSON.stringify(item)));
+              member.run(owner, kind, series, String(item.Id), ordinal);
+            }
+            db.prepare('INSERT OR IGNORE INTO tv_series_done VALUES (?, ?, ?)').run(owner, kind, series);
+            db.exec('COMMIT');
+          } catch (error) {
+            if (db.isTransaction) db.exec('ROLLBACK');
+            throw error;
+          }
         }
-        const items = 'seasons' in built ? built.seasons : built.episodes;
+        const members = db.prepare('SELECT id FROM tv_series WHERE owner=? AND kind=? AND series=? ORDER BY ordinal').all(owner, kind, series);
         db.exec('BEGIN');
         try {
-          for (const item of items) {
-            const result = insert.run(scope, kind, String(item.Id), total, JSON.stringify(item));
+          for (const member of members) {
+            const result = insert.run(scope, kind, String(member.id), total);
             total += Number(result.changes);
           }
           db.exec('COMMIT');
-        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        } catch (error) {
+          if (db.isTransaction) db.exec('ROLLBACK');
+          throw error;
+        }
       } finally {
         ctx.metas.clear();
       }
@@ -584,6 +607,9 @@ const tvJobs = new Map<string, Promise<void>>();
 let tvJobTail: Promise<void> = Promise.resolve();
 type TvCatalog = Parameters<typeof getCatalogPage>[1];
 type TvKind = 'season' | 'episode';
+function tvOwner(ctx: JellyfinRequestContext): string {
+  return createHash('sha256').update(JSON.stringify([ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name])).digest('hex');
+}
 function tvScope(ctx: JellyfinRequestContext, catalog: TvCatalog, genre?: string): string {
   return createHash('sha256').update(JSON.stringify([
     ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
@@ -655,8 +681,8 @@ async function tvLibraryIndex(
     return null;
   }
   const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
-  const rows = db.prepare('SELECT payload FROM tv_rows WHERE scope=? AND kind=? ORDER BY ordinal LIMIT ? OFFSET ?').all(scope, kind, limit, startIndex);
-  return {items: rows.map(row => JSON.parse(String(row.payload)) as JellyfinItem), total};
+  const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
+  return {items: rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem), total};
 }
 
 async function handleItems(
