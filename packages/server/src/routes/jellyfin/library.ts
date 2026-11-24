@@ -362,7 +362,7 @@ function wantsTotal(req: Request): boolean {
  * How many items one library request may return.
  */
 function browseLimit(req: Request): number {
-  const cap = Math.min(500, Math.max(100, appConfig.jellyfin.maxCatalogItems));
+  const cap = Math.min(500, Math.max(/infuse/i.test(req.jf?.client.name ?? '') ? 200 : 100, appConfig.jellyfin.maxCatalogItems));
   return Math.min(Math.max(1, qi(req, 'Limit', 100)), cap);
 }
 
@@ -540,7 +540,7 @@ async function buildTvIndex(
   let offset = Number(state?.offset ?? 0);
   let complete = Boolean(state?.complete);
   let total = Number(count.get(scope, kind)?.n ?? 0);
-  const batchSize = 4;
+  const batchSize = 16;
   // Build incrementally and persist each catalog page. Never retain a full
   // catalog's expanded metadata in JavaScript memory.
   while (!complete) {
@@ -548,6 +548,14 @@ async function buildTvIndex(
       startIndex: offset, limit: batchSize, genre, exactTotal: false,
     });
     if (!page.items.length) { complete = true; break; }
+    // Prefetch only uncached series metadata, with bounded concurrency.
+    await mapLimited(page.items, 4, async preview => {
+      if (preview.type !== 'series') return;
+      const series = preview.type + ':' + preview.id;
+      if (!db.prepare('SELECT 1 FROM tv_series_done WHERE owner=? AND kind=? AND series=?').get(owner, kind, series)) {
+        await getMeta(ctx, preview.type, preview.id).catch(() => null);
+      }
+    });
     for (const preview of page.items) {
       if (preview.type !== 'series') continue;
       try {
@@ -591,9 +599,10 @@ async function buildTvIndex(
           throw error;
         }
       } finally {
-        ctx.metas.clear();
+        // Keep the bounded prefetched batch available until it is consumed.
       }
     }
+    ctx.metas.clear();
     offset += page.items.length;
     complete = false;
     save.run(scope, kind, offset, Number(complete), Date.now());
@@ -644,7 +653,7 @@ async function tvLibraryIndex(
   const db = openTvIndex();
   const scope = tvScope(ctx, catalog, genre);
   const count = db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?');
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + 90000;
   let total = Number(count.get(scope, kind)?.n ?? 0);
   // Build only the requested catalog, in resumable batches. Keep one extra
   // row as evidence of another page, unless the catalog is exhausted.
@@ -976,7 +985,8 @@ async function handleItems(
       (!requiresGenre(catalog) || !!genreFromId)
     ) {
       const kind = types!.has('season') ? 'season' : 'episode';
-      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, limit);
+      const indexLimit = Math.min(500, Math.max(1, qi(req, 'Limit', limit)));
+      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, indexLimit);
       if (!indexed) {
         res.setHeader('Retry-After', '60');
         res.status(503).json({ Message: 'TV index is being prepared. Retry after indexing completes.' });
