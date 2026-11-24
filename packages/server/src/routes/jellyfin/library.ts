@@ -1,3 +1,6 @@
+import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { Router, type Request, type Response } from 'express';
 import {
   buildContentItem,
@@ -488,44 +491,100 @@ router.get(
  * metadata snapshots. This is a memory-safety bridge, not a full index:
  * full-library pagination needs a durable index of expanded item IDs.
  */
+// Separate sidecar: never modifies the application's existing database.
+let tvIndexDb: DatabaseSync | undefined;
+function openTvIndex(): DatabaseSync {
+  if (tvIndexDb) return tvIndexDb;
+  mkdirSync('./data', { recursive: true });
+  const db = new DatabaseSync('./data/infuse-tv-index.sqlite');
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA cache_size=-4096;
+    CREATE TABLE IF NOT EXISTS tv_rows (
+      scope TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL, payload TEXT NOT NULL,
+      PRIMARY KEY(scope, kind, id)
+    );
+    CREATE INDEX IF NOT EXISTS tv_rows_order ON tv_rows(scope, kind, ordinal);
+    CREATE TABLE IF NOT EXISTS tv_progress (
+      scope TEXT NOT NULL, kind TEXT NOT NULL, offset INTEGER NOT NULL,
+      complete INTEGER NOT NULL, updated INTEGER NOT NULL,
+      PRIMARY KEY(scope, kind)
+    );`);
+  tvIndexDb = db;
+  return db;
+}
+
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
   catalog: Parameters<typeof getCatalogPage>[1],
   kind: 'season' | 'episode',
-  genre?: string
-): Promise<JellyfinItem[]> {
+  genre: string | undefined,
+  startIndex: number,
+  limit: number,
+  signal: AbortSignal
+): Promise<{ items: JellyfinItem[]; total: number }> {
+  const db = openTvIndex();
+  const scope = createHash('sha256').update(JSON.stringify([
+    ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
+  ])).digest('hex');
   const engine = await ctx.engine();
-  const results: JellyfinItem[] = [];
-  const seen = new Set<string>();
+  const progress = db.prepare('SELECT offset, complete, updated FROM tv_progress WHERE scope=? AND kind=?');
+  const save = db.prepare('INSERT OR REPLACE INTO tv_progress VALUES (?, ?, ?, ?, ?)');
+  const count = db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?');
+  const insert = db.prepare('INSERT OR IGNORE INTO tv_rows VALUES (?, ?, ?, ?, ?)');
+  let state = progress.get(scope, kind);
+  if (state && Date.now() - Number(state.updated) > 24 * 3600 * 1000) {
+    db.exec('BEGIN');
+    try {
+      db.prepare('DELETE FROM tv_rows WHERE scope=? AND kind=?').run(scope, kind);
+      db.prepare('DELETE FROM tv_progress WHERE scope=? AND kind=?').run(scope, kind);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    state = undefined;
+  }
+  let offset = Number(state?.offset ?? 0);
+  let complete = Boolean(state?.complete);
+  let total = Number(count.get(scope, kind)?.n ?? 0);
   const batchSize = 4;
-  const maxSeries = 24;
-  for (let offset = 0; offset < maxSeries; offset += batchSize) {
+  // Build incrementally and persist each catalog page. Never retain a full
+  // catalog's expanded metadata in JavaScript memory.
+  while (!complete && !signal.aborted && total < startIndex + limit) {
     const page = await getCatalogPage(engine, catalog, {
-      startIndex: offset,
-      limit: batchSize,
-      genre,
-      exactTotal: false,
+      startIndex: offset, limit: batchSize, genre, exactTotal: false,
     });
-    if (!page.items.length) break;
+    if (!page.items.length) { complete = true; break; }
     for (const preview of page.items) {
+      if (signal.aborted) break;
       if (preview.type !== 'series') continue;
-      const descriptor = { t: preview.type, i: preview.id };
       try {
+        const descriptor = { t: preview.type, i: preview.id };
         const items = kind === 'season'
           ? (await seasonsForSeries(ctx, descriptor))?.seasons ?? []
           : (await episodesForSeries(ctx, descriptor))?.episodes ?? [];
-        for (const item of items) {
-          if (seen.has(item.Id)) continue;
-          seen.add(item.Id);
-          results.push(item);
-        }
-      } catch {
-        // One unavailable show must not abort the entire library response.
+        db.exec('BEGIN');
+        try {
+          for (const item of items) {
+            const result = insert.run(scope, kind, String(item.Id), total, JSON.stringify(item));
+            total += Number(result.changes);
+          }
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+      } finally {
+        ctx.metas.clear();
       }
     }
-    if (page.items.length < batchSize) break;
+    if (signal.aborted) break;
+    offset += page.items.length;
+    complete = page.items.length < batchSize;
+    save.run(scope, kind, offset, Number(complete), Date.now());
   }
-  return results;
+  save.run(scope, kind, offset, Number(complete), Date.now());
+  const rows = db.prepare('SELECT payload FROM tv_rows WHERE scope=? AND kind=? ORDER BY ordinal LIMIT ? OFFSET ?')
+    .all(scope, kind, limit, startIndex);
+  return {
+    items: rows.map(row => JSON.parse(String(row.payload)) as JellyfinItem),
+    // Until exhausted, advertise another page rather than a false exact total.
+    total: complete ? total : Math.max(total + 1, startIndex + limit + 1),
+  };
 }
 
 async function handleItems(
@@ -836,15 +895,10 @@ async function handleItems(
       (!requiresGenre(catalog) || !!genreFromId)
     ) {
       const kind = types!.has('season') ? 'season' : 'episode';
-      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId);
-      const filtered = excludeTypes(req, applyUserFilters(req, indexed));
-      sendItems(
-        req,
-        res,
-        filtered.slice(startIndex, startIndex + limit),
-        filtered.length,
-        startIndex
-      );
+      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, limit, untilClosed(res));
+      if (res.destroyed) return;
+      const filtered = excludeTypes(req, applyUserFilters(req, indexed.items));
+      sendItems(req, res, filtered, indexed.total, startIndex);
       return;
     }
     if (
