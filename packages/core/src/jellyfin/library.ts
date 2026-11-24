@@ -820,30 +820,43 @@ export async function searchCatalogs(
     ? searchable
     : searchable.filter((c, i) => {
         const types = evidence[i]?.types;
-        // A search-only catalog cannot be sniffed through its unfiltered
-        // first page. Do not exclude it using stale browse evidence.
         return (
-          !isBrowsable(c) ||
           !types?.length ||
           types.some((t) => wanted.has(sniffedKind(t, evidence[i]!.leaves)))
         );
       });
-  return searchEach(
+  const diagnostic = process.env.INFUSE_SEARCH_DIAGNOSTICS === '1';
+  if (diagnostic) {
+    logger.info(
+      {
+        searchOnly: true,
+        totalCatalogs: (engine.getCatalogs() ?? []).length,
+        searchableCatalogs: searchable.map((c) => ({
+          type: c.type,
+          id: c.id,
+          name: c.name,
+        })),
+        selectedCatalogs: catalogs.length,
+        requestedKinds: kinds ?? null,
+      },
+      '[infuse-search-diagnostic] catalog discovery'
+    );
+  }
+  const results = await searchEach(
     engine,
     catalogs,
     term,
     limit,
-    (i) => {
-      if (!wanted) return true;
-      // Search responses declare their actual movie/series type; unrelated
-      // catalog evidence must not reclassify them before the type filter.
-      const kind =
-        i.type === 'movie' || i.type === 'series'
-          ? i.type
-          : entryKind(i, leafEvidence);
-      return wanted.has(kind);
-    }
+    (i) => !wanted || wanted.has(entryKind(i, leafEvidence)),
+    diagnostic
   );
+  if (diagnostic) {
+    logger.info(
+      { results: results.length, resultKinds: results.map((p) => p.type) },
+      '[infuse-search-diagnostic] catalog search complete'
+    );
+  }
+  return results;
 }
 
 export function searchPersonCatalogs(
@@ -866,7 +879,8 @@ async function searchEach(
   catalogs: Catalog[],
   term: string,
   limit: number,
-  keep: (item: MetaPreview) => boolean = () => true
+  keep: (item: MetaPreview) => boolean = () => true,
+  diagnostic = false
 ): Promise<MetaPreview[]> {
   if (!catalogs.length) return [];
   /*
@@ -887,9 +901,32 @@ async function searchEach(
       )
     )
   );
+  if (diagnostic) {
+    logger.info(
+      {
+        catalogs: results.map((r, i) => ({
+          id: catalogs[i].id,
+          type: catalogs[i].type,
+          status: r.status,
+          rawCount: r.status === 'fulfilled' ? r.value.items.length : null,
+          error:
+            r.status === 'rejected'
+              ? String(r.reason instanceof Error ? r.reason.message : r.reason).slice(0, 200)
+              : null,
+        })),
+      },
+      '[infuse-search-diagnostic] per-catalog search responses'
+    );
+  }
   const lists = results.map((r) =>
     r.status === 'fulfilled' ? r.value.items.filter(keep) : []
   );
+  if (diagnostic) {
+    logger.info(
+      { filteredCounts: lists.map((list) => list.length) },
+      '[infuse-search-diagnostic] result filtering'
+    );
+  }
   const seen = new Set<string>();
   const out: MetaPreview[] = [];
   for (let rank = 0; out.length < limit; rank++) {
