@@ -385,7 +385,7 @@ export function send(
       sample: series.slice(0, 2).map(i => ({id: i.Id, name: i.Name, folder: i.IsFolder, parent: i.ParentId, childCount: i.ChildCount}))
     }));
   }
-  const out = items.map(stripInternal);
+  const out = items.map(item => stripInternal(req.jf ? consistentTvItem(req.jf,item) : item));
   res.json(listResult(out, wantsTotal(req) ? total : out.length, startIndex));
 }
 
@@ -710,12 +710,44 @@ async function tvLibraryIndex(
 }
 
 // Persist original parent artwork independently of the episode index.
+function mergeSeriesArt(previous: Partial<JellyfinItem>, current: Partial<JellyfinItem>): Partial<JellyfinItem> {
+  const tags = {...(previous.ImageTags as Record<string,string> | undefined)};
+  for (const [key,value] of Object.entries((current.ImageTags as Record<string,string> | undefined) ?? {})) if (value) tags[key] = value;
+  return {ImageTags: tags,
+    BackdropImageTags: (current.BackdropImageTags as string[] | undefined)?.length ? current.BackdropImageTags : previous.BackdropImageTags,
+    ProviderIds: {...(previous.ProviderIds as Record<string,string> | undefined), ...(current.ProviderIds as Record<string,string> | undefined)},
+    PrimaryImageAspectRatio: current.PrimaryImageAspectRatio || previous.PrimaryImageAspectRatio || 0.6666};
+}
+function readSeriesArt(ctx: JellyfinRequestContext, id: string): Partial<JellyfinItem> {
+  const row = openTvIndex().prepare('SELECT payload FROM tv_artwork WHERE owner=? AND id=?').get(tvOwner(ctx), id);
+  return row ? JSON.parse(String(row.payload)) as Partial<JellyfinItem> : {};
+}
 function saveSeriesArt(ctx: JellyfinRequestContext, item: JellyfinItem, id = String(item.Id)) {
-  if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) return;
-  openTvIndex().prepare('INSERT OR REPLACE INTO tv_artwork VALUES (?, ?, ?)').run(tvOwner(ctx), id, JSON.stringify({
-    ImageTags: item.ImageTags, BackdropImageTags: item.BackdropImageTags,
-    ProviderIds: item.ProviderIds, PrimaryImageAspectRatio: item.PrimaryImageAspectRatio || 0.6666
-  }));
+  const art = mergeSeriesArt(readSeriesArt(ctx,id), item);
+  if (!(art.ImageTags as Record<string,string> | undefined)?.Primary) return;
+  openTvIndex().prepare('INSERT OR REPLACE INTO tv_artwork VALUES (?, ?, ?)').run(tvOwner(ctx), id, JSON.stringify(art));
+}
+function consistentTvItem(ctx: JellyfinRequestContext, item: JellyfinItem): JellyfinItem {
+  if (!/infuse/i.test(ctx.client.name)) return item;
+  try {
+    if (item.Type === 'Series') {
+      saveSeriesArt(ctx,item);
+      const art = readSeriesArt(ctx,String(item.Id));
+      if (!(art.ImageTags as Record<string,string> | undefined)?.Primary) return item;
+      return {...item,...mergeSeriesArt(art,item),Type:'Series',IsFolder:true};
+    }
+    if ((item.Type === 'Episode' || item.Type === 'Season') && item.SeriesId) {
+      const art = readSeriesArt(ctx,String(item.SeriesId));
+      const tags = art.ImageTags as Record<string,string> | undefined;
+      const primary = tags?.Primary || item.SeriesPrimaryImageTag;
+      if (!primary) return item;
+      return {...item, SeriesPrimaryImageTag:primary,
+        ...(item.Type === 'Season' ? {ImageTags:{...(item.ImageTags as Record<string,string> | undefined),Primary:(item.ImageTags as Record<string,string> | undefined)?.Primary || primary},PrimaryImageAspectRatio:item.PrimaryImageAspectRatio || 0.6666} : {}),
+        ...(art.BackdropImageTags ? {ParentBackdropItemId:item.SeriesId,ParentBackdropImageTags:art.BackdropImageTags} : {}),
+        ...(tags?.Logo ? {ParentLogoItemId:item.SeriesId,ParentLogoImageTag:tags.Logo} : {})};
+    }
+  } catch { /* artwork storage must never prevent a library response */ }
+  return item;
 }
 async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sourceId?: string): Promise<Partial<JellyfinItem>> {
   const id = String(ep.SeriesId ?? '');
@@ -730,6 +762,7 @@ async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sour
   const primary = poster ? encodeImageTag(poster) : inherited;
   if (primary) {
     const art = {ImageTags: {Primary: primary}, BackdropImageTags: backdrop ? [encodeImageTag(backdrop)] : ep.ParentBackdropImageTags, PrimaryImageAspectRatio: 0.6666};
+    saveSeriesArt(ctx, {...ep,...art} as JellyfinItem,id);
     return art;
   }
   const row = sourceId ? undefined : db.prepare("SELECT series FROM tv_series WHERE owner=? AND kind=? AND id=? LIMIT 1").get(tvOwner(ctx), String(ep.Type).toLowerCase(), String(ep.Id));
@@ -770,11 +803,12 @@ async function originalIndexedSeries(ctx: JellyfinRequestContext, ep: JellyfinIt
   }
   const fallback = await parentArtwork(ctx, ep, id).catch(() => ({} as Partial<JellyfinItem>));
   const item = original ?? buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview);
-  const tags = {...(fallback.ImageTags as Record<string, string> | undefined), ...(item.ImageTags as Record<string, string> | undefined)};
+  const merged = mergeSeriesArt(fallback,item);
+  const tags = merged.ImageTags;
   return {...item, Id: seriesId, Type: 'Series', IsFolder: true,
     ImageTags: tags,
     BackdropImageTags: (item.BackdropImageTags as string[] | undefined)?.length ? item.BackdropImageTags : fallback.BackdropImageTags,
-    ProviderIds: item.ProviderIds ?? fallback.ProviderIds,
+    ProviderIds: merged.ProviderIds,
     PrimaryImageAspectRatio: item.PrimaryImageAspectRatio || fallback.PrimaryImageAspectRatio || 0.6666};
 }
 async function restoreIndexedArtwork(ctx: JellyfinRequestContext, items: JellyfinItem[]): Promise<JellyfinItem[]> {
@@ -1964,7 +1998,7 @@ router.get(
       res.status(404).json({ Message: 'Item not found' });
       return;
     }
-    res.json(stripInternal(item));
+    res.json(stripInternal(consistentTvItem(ctx,item)));
   })
 );
 
