@@ -701,7 +701,22 @@ async function tvLibraryIndex(
   const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
   console.info('[infuse-tv-index] page ready', JSON.stringify({scope, kind, startIndex, limit, total, complete: tvReady(scope, kind)}));
   const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
-  return {items: rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem), total};
+  return {items: rows.map(row => inspectIndexedEpisodeArtwork(JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem)), total};
+}
+
+// Compare a small set of indexed episode records without changing their payloads.
+const artworkEpisodeSamples = new Set<string>();
+function inspectIndexedEpisodeArtwork(item: JellyfinItem) {
+  const name = String(item.SeriesName ?? '').trim().toLowerCase();
+  if (!['adults', 'the altruists', 'lucky'].includes(name)) return item;
+  if (artworkEpisodeSamples.has(name)) return item;
+  artworkEpisodeSamples.add(name);
+  const fields = Object.fromEntries(Object.entries(item).filter(([key]) =>
+    /image|artwork|provider|series|parent/i.test(key)));
+  console.info('[infuse-artwork-diagnostic]', JSON.stringify({
+    stage: 'indexed-episode', name, id: item.Id, fields
+  }));
+  return item;
 }
 
 async function handleItems(
@@ -1208,7 +1223,7 @@ async function handleItems(
     const rows = db.prepare('SELECT p.payload FROM (SELECT DISTINCT r.id' + where +
       ' ORDER BY r.id LIMIT ? OFFSET ?) ids JOIN tv_payloads p ON p.id=ids.id AND p.owner=? AND p.kind=? ORDER BY ids.id')
       .all(kind, ...scopes, pageLimit, startIndex, tvOwner(ctx), kind);
-    const items = rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem);
+    const items = rows.map(row => inspectIndexedEpisodeArtwork(JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem));
     sendItems(req, res, excludeTypes(req, applyUserFilters(req, items)), total, startIndex);
     return;
   }
