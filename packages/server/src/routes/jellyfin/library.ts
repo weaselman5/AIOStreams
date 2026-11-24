@@ -634,7 +634,18 @@ function queueTvIndex(ctx: JellyfinRequestContext, catalog: TvCatalog, kind: TvK
   if (tvReady(scope, kind)) return Promise.resolve();
   const existing = tvJobs.get(key);
   if (existing) return existing;
-  const job = tvJobTail.then(() => buildTvIndex(ctx, catalog, kind, genre, scope))
+  const job = tvJobTail.then(async () => {
+    const progress = openTvIndex().prepare('SELECT offset FROM tv_progress WHERE scope=? AND kind=?');
+    while (!tvReady(scope, kind)) {
+      const before = Number(progress.get(scope, kind)?.offset ?? 0);
+      await buildTvIndex(ctx, catalog, kind, genre, scope);
+      if (!tvReady(scope, kind) && Number(progress.get(scope, kind)?.offset ?? 0) <= before) {
+        throw new Error('TV index made no progress');
+      }
+      ctx.metas.clear();
+      await new Promise<void>(resolve => setTimeout(resolve, 25));
+    }
+  })
     .catch(error => { console.warn('[infuse-tv-index] failed', JSON.stringify({scope, kind, message: String(error?.message ?? 'unknown')})); })
     .finally(() => { tvJobs.delete(key); ctx.metas.clear(); });
   tvJobs.set(key, job);
@@ -642,6 +653,28 @@ function queueTvIndex(ctx: JellyfinRequestContext, catalog: TvCatalog, kind: TvK
   console.info('[infuse-tv-index] queued', JSON.stringify({scope, kind, pending: tvJobs.size}));
   return job;
 }
+const tvWarmups = new Set<string>();
+async function warmTvIndexes(ctx: JellyfinRequestContext): Promise<void> {
+  const owner = tvOwner(ctx);
+  if (tvWarmups.has(owner)) return;
+  tvWarmups.add(owner);
+  try {
+    const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
+    for (const view of views) {
+      const genres = requiresGenre(view.catalog) ? genreOptions(view.catalog) : [undefined];
+      for (const genre of genres) {
+        await queueTvIndex(ctx, view.catalog, 'season', genre);
+        await queueTvIndex(ctx, view.catalog, 'episode', genre);
+      }
+    }
+    console.info('[infuse-tv-index] background pass finished', JSON.stringify({owner}));
+  } catch (error) {
+    console.warn('[infuse-tv-index] background pass failed', String(error));
+  } finally {
+    tvWarmups.delete(owner);
+  }
+}
+
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
   catalog: TvCatalog,
@@ -652,26 +685,11 @@ async function tvLibraryIndex(
 ): Promise<{ items: JellyfinItem[]; total: number } | null> {
   const db = openTvIndex();
   const scope = tvScope(ctx, catalog, genre);
-  const count = db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?');
-  const deadline = Date.now() + 90000;
-  let total = Number(count.get(scope, kind)?.n ?? 0);
-  // Build only the requested catalog, in resumable batches. Keep one extra
-  // row as evidence of another page, unless the catalog is exhausted.
-  while (!tvReady(scope, kind) && total <= startIndex + limit) {
-    const before = db.prepare('SELECT offset FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind)?.offset;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) return null;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const finished = await Promise.race([
-      queueTvIndex(ctx, catalog, kind, genre).then(() => true),
-      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), remaining); }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (!finished) return null;
-    total = Number(count.get(scope, kind)?.n ?? 0);
-    const after = db.prepare('SELECT offset FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind)?.offset;
-    if (!tvReady(scope, kind) && before === after) return null;
+  if (!tvReady(scope, kind)) {
+    void queueTvIndex(ctx, catalog, kind, genre);
+    return null;
   }
+  const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
   console.info('[infuse-tv-index] page ready', JSON.stringify({scope, kind, startIndex, limit, total, complete: tvReady(scope, kind)}));
   const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
   return {items: rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem), total};
@@ -987,6 +1005,7 @@ async function handleItems(
       const kind = types!.has('season') ? 'season' : 'episode';
       const indexLimit = Math.min(500, Math.max(1, qi(req, 'Limit', limit)));
       const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, indexLimit);
+      void warmTvIndexes(ctx);
       if (!indexed) {
         res.setHeader('Retry-After', '60');
         res.status(503).json({ Message: 'TV index is being prepared. Retry after indexing completes.' });
