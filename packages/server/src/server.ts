@@ -68,6 +68,18 @@ const logger = createLogger('server');
 
 async function initialiseDatabase() {
   try {
+    // Recover space before opening the primary database or refreshing sources.
+    // Only the obsolete, rebuildable TV index from this fork is removed.
+    const { rmSync, existsSync, statSync } = await import('node:fs');
+    let reclaimed = 0;
+    for (const suffix of ['-wal', '-shm', '-journal', '']) {
+      const path = './data/infuse-tv-index.sqlite' + suffix;
+      if (existsSync(path)) {
+        reclaimed += statSync(path).size;
+        rmSync(path);
+      }
+    }
+    console.info('[infuse-tv-index] startup cleanup', JSON.stringify({ reclaimedBytes: reclaimed }));
     await initDb(appConfig.bootstrap.databaseUri);
     await initialiseConfig();
     installPrivateAddressGuard();
