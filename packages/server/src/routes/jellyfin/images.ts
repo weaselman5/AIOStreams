@@ -248,6 +248,20 @@ async function relay(req: Request, res: Response, url: string) {
 }
 
 async function itemImage(req: Request, res: Response) {
+  const diagnosticId = param(req, 'itemId').replace(/-/g, '').toLowerCase();
+  if (diagnosticId === 'a12202000000018995ffffffff000000') {
+    console.info('[infuse-artwork-diagnostic]', JSON.stringify({
+      stage: 'image-request', id: diagnosticId, type: param(req, 'type'),
+      method: req.method, hasTag: !!qs(req, 'tag'), relay: shouldRelay(req)
+    }));
+    res.once('finish', () => {
+      console.info('[infuse-artwork-diagnostic]', JSON.stringify({
+        stage: 'image-response', id: diagnosticId, type: param(req, 'type'),
+        status: res.statusCode, contentType: res.getHeader('Content-Type'),
+        redirected: !!res.getHeader('Location')
+      }));
+    });
+  }
   const url = await imageUrlFor(
     req,
     param(req, 'itemId'),
