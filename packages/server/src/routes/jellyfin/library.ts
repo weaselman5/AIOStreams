@@ -513,19 +513,14 @@ function openTvIndex(): DatabaseSync {
   return db;
 }
 
-async function tvLibraryIndex(
+async function buildTvIndex(
   ctx: JellyfinRequestContext,
   catalog: Parameters<typeof getCatalogPage>[1],
   kind: 'season' | 'episode',
   genre: string | undefined,
-  startIndex: number,
-  limit: number,
-  signal: AbortSignal
-): Promise<{ items: JellyfinItem[]; total: number }> {
+  scope: string
+): Promise<void> {
   const db = openTvIndex();
-  const scope = createHash('sha256').update(JSON.stringify([
-    ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
-  ])).digest('hex');
   const engine = await ctx.engine();
   const progress = db.prepare('SELECT offset, complete, updated FROM tv_progress WHERE scope=? AND kind=?');
   const save = db.prepare('INSERT OR REPLACE INTO tv_progress VALUES (?, ?, ?, ?, ?)');
@@ -547,19 +542,20 @@ async function tvLibraryIndex(
   const batchSize = 4;
   // Build incrementally and persist each catalog page. Never retain a full
   // catalog's expanded metadata in JavaScript memory.
-  while (!complete && !signal.aborted && total < startIndex + limit) {
+  while (!complete) {
     const page = await getCatalogPage(engine, catalog, {
       startIndex: offset, limit: batchSize, genre, exactTotal: false,
     });
     if (!page.items.length) { complete = true; break; }
     for (const preview of page.items) {
-      if (signal.aborted) break;
       if (preview.type !== 'series') continue;
       try {
         const descriptor = { t: preview.type, i: preview.id };
-        const items = kind === 'season'
-          ? (await seasonsForSeries(ctx, descriptor))?.seasons ?? []
-          : (await episodesForSeries(ctx, descriptor))?.episodes ?? [];
+        const built = kind === 'season'
+          ? await seasonsForSeries(ctx, descriptor)
+          : await episodesForSeries(ctx, descriptor);
+        if (!built) throw new Error('TV index metadata unavailable');
+        const items = 'seasons' in built ? built.seasons : built.episodes;
         db.exec('BEGIN');
         try {
           for (const item of items) {
@@ -572,19 +568,45 @@ async function tvLibraryIndex(
         ctx.metas.clear();
       }
     }
-    if (signal.aborted) break;
     offset += page.items.length;
-    complete = page.items.length < batchSize;
+    complete = false;
     save.run(scope, kind, offset, Number(complete), Date.now());
+    await new Promise<void>(resolve => setTimeout(resolve, 25));
   }
   save.run(scope, kind, offset, Number(complete), Date.now());
-  const rows = db.prepare('SELECT payload FROM tv_rows WHERE scope=? AND kind=? ORDER BY ordinal LIMIT ? OFFSET ?')
-    .all(scope, kind, limit, startIndex);
-  return {
-    items: rows.map(row => JSON.parse(String(row.payload)) as JellyfinItem),
-    // Until exhausted, advertise another page rather than a false exact total.
-    total: complete ? total : Math.max(total + 1, startIndex + limit + 1),
-  };
+  console.info('[infuse-tv-index] complete', JSON.stringify({scope, kind, total}));
+}
+
+const tvJobs = new Map<string, Promise<void>>();
+let tvJobTail: Promise<void> = Promise.resolve();
+async function tvLibraryIndex(
+  ctx: JellyfinRequestContext,
+  catalog: Parameters<typeof getCatalogPage>[1],
+  kind: 'season' | 'episode',
+  genre: string | undefined,
+  startIndex: number,
+  limit: number
+): Promise<{ items: JellyfinItem[]; total: number } | null> {
+  const db = openTvIndex();
+  const scope = createHash('sha256').update(JSON.stringify([
+    ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name, catalog, genre
+  ])).digest('hex');
+  const state = db.prepare('SELECT complete, updated FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind);
+  if (!state?.complete || Date.now() - Number(state.updated) > 24 * 3600 * 1000) {
+    const key = scope + ':' + kind;
+    if (!tvJobs.has(key)) {
+      const job = tvJobTail.then(() => buildTvIndex(ctx, catalog, kind, genre, scope))
+        .catch(error => { console.warn('[infuse-tv-index] failed', JSON.stringify({scope, kind, message: String(error?.message ?? 'unknown')})); })
+        .finally(() => { tvJobs.delete(key); ctx.metas.clear(); });
+      tvJobs.set(key, job);
+      tvJobTail = job;
+      console.info('[infuse-tv-index] queued', JSON.stringify({scope, kind, pending: tvJobs.size}));
+    }
+    return null;
+  }
+  const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
+  const rows = db.prepare('SELECT payload FROM tv_rows WHERE scope=? AND kind=? ORDER BY ordinal LIMIT ? OFFSET ?').all(scope, kind, limit, startIndex);
+  return {items: rows.map(row => JSON.parse(String(row.payload)) as JellyfinItem), total};
 }
 
 async function handleItems(
@@ -895,7 +917,12 @@ async function handleItems(
       (!requiresGenre(catalog) || !!genreFromId)
     ) {
       const kind = types!.has('season') ? 'season' : 'episode';
-      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, limit, untilClosed(res));
+      const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, limit);
+      if (!indexed) {
+        res.setHeader('Retry-After', '60');
+        res.status(503).json({ Message: 'TV index is being prepared. Retry after indexing completes.' });
+        return;
+      }
       if (res.destroyed) return;
       const filtered = excludeTypes(req, applyUserFilters(req, indexed.items));
       sendItems(req, res, filtered, indexed.total, startIndex);
