@@ -1055,7 +1055,7 @@ async function handleItems(
           if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
           }
-          if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
+          if (String(ep.SeriesName).trim().toLowerCase() === 'adults') {
             console.info('[infuse-artwork-diagnostic]', JSON.stringify({
               stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
               tags: item.ImageTags, backdrops: item.BackdropImageTags,
@@ -1271,7 +1271,7 @@ async function handleItems(
           if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
           }
-          if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
+          if (String(ep.SeriesName).trim().toLowerCase() === 'adults') {
             console.info('[infuse-artwork-diagnostic]', JSON.stringify({
               stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
               tags: item.ImageTags, backdrops: item.BackdropImageTags,
