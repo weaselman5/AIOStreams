@@ -1033,6 +1033,27 @@ async function handleItems(
           else if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
             item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
           }
+          // Resolve original series metadata only when the indexed poster is missing.
+          // Keep requests sequential and use the existing metadata cache.
+          if (!item.ImageTags?.Primary) {
+            try {
+              const meta = await getMeta(ctx, 'series', id);
+              if (meta) {
+                const original = buildContentItem(ctx.build, { ...meta, id, type: 'series' });
+                item.ImageTags = original.ImageTags;
+                item.BackdropImageTags = original.BackdropImageTags;
+                item.ProviderIds = original.ProviderIds;
+                item.PrimaryImageAspectRatio = original.PrimaryImageAspectRatio;
+              }
+            } catch {
+              // A metadata failure must not remove a series from the library.
+            } finally {
+              ctx.metas.clear();
+            }
+          }
+          if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
+            item.PrimaryImageAspectRatio = 0.6666;
+          }
           items.push({ ...item, Id: String(ep.SeriesId), ParentId: parentId, Type: 'Series', IsFolder: true });
         }
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
@@ -1218,6 +1239,27 @@ async function handleItems(
           if (background) item.BackdropImageTags = [encodeImageTag(background)];
           else if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
             item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
+          }
+          // Resolve original series metadata only when the indexed poster is missing.
+          // Keep requests sequential and use the existing metadata cache.
+          if (!item.ImageTags?.Primary) {
+            try {
+              const meta = await getMeta(ctx, 'series', id);
+              if (meta) {
+                const original = buildContentItem(ctx.build, { ...meta, id, type: 'series' });
+                item.ImageTags = original.ImageTags;
+                item.BackdropImageTags = original.BackdropImageTags;
+                item.ProviderIds = original.ProviderIds;
+                item.PrimaryImageAspectRatio = original.PrimaryImageAspectRatio;
+              }
+            } catch {
+              // A metadata failure must not remove a series from the library.
+            } finally {
+              ctx.metas.clear();
+            }
+          }
+          if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
+            item.PrimaryImageAspectRatio = 0.6666;
           }
           items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
         }
