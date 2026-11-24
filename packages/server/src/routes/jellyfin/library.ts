@@ -998,8 +998,8 @@ async function handleItems(
   if (catalogDesc) {
     const catalog = findCatalog(engine, catalogDesc.t, catalogDesc.c);
   // Enumerate existing indexed parent series without additional metadata requests.
-  if (catalog && (!requiresGenre(catalog) || !!genreFromId) && /infuse/i.test(ctx.client.name) && types?.size === 1 &&
-      types.has('series') && !searchTerm  &&
+  if (catalog && (!requiresGenre(catalog) || !!genreFromId) && /infuse/i.test(ctx.client.name) && types?.has('series') &&
+      (types.size === 1 || (await knownCatalogKinds(ctx.userData, catalog))?.every(k => k === 'series')) && !searchTerm  &&
       !filters.length && !wantsFavorites && !wantsPlayed && !wantsResumable) {
     const db = openTvIndex();
     const owner = tvOwner(ctx);
