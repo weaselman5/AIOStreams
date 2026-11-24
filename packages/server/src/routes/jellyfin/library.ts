@@ -685,10 +685,8 @@ async function tvLibraryIndex(
 ): Promise<{ items: JellyfinItem[]; total: number } | null> {
   const db = openTvIndex();
   const scope = tvScope(ctx, catalog, genre);
-  if (!tvReady(scope, kind)) {
-    void queueTvIndex(ctx, catalog, kind, genre);
-    return null;
-  }
+  // Never fail a library scan merely because a background snapshot is growing.
+  if (!tvReady(scope, kind)) void queueTvIndex(ctx, catalog, kind, genre);
   const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
   console.info('[infuse-tv-index] page ready', JSON.stringify({scope, kind, startIndex, limit, total, complete: tvReady(scope, kind)}));
   const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
@@ -1104,6 +1102,30 @@ async function handleItems(
   /* A parent that resolved to nothing browsable holds nothing. */
   if (parentId) {
     sendItems(req, res, [], 0, startIndex);
+    return;
+  }
+  // Native Infuse TV-wide recursive queries must not fall through to the
+  // first-page-only catalog browsing path.
+  if (/infuse/i.test(ctx.client.name) && recursive && types?.size === 1 &&
+      (types.has('season') || types.has('episode')) && !searchTerm &&
+      !genre && !genreIds.length && !filters.length && !wantsFavorites && !wantsPlayed && !wantsResumable) {
+    const kind: TvKind = types.has('season') ? 'season' : 'episode';
+    void warmTvIndexes(ctx);
+    const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
+    const scopes = [...new Set(views.flatMap(view =>
+      (requiresGenre(view.catalog) ? genreOptions(view.catalog) : [undefined])
+        .map(g => tvScope(ctx, view.catalog, g))))];
+    const db = openTvIndex();
+    if (!scopes.length) { sendItems(req, res, [], 0, startIndex); return; }
+    const placeholders = scopes.map(() => '?').join(',');
+    const where = ' FROM tv_rows r WHERE r.kind=? AND r.scope IN (' + placeholders + ')';
+    const total = Number(db.prepare('SELECT COUNT(DISTINCT r.id) AS n' + where).get(kind, ...scopes)?.n ?? 0);
+    const pageLimit = Math.min(500, Math.max(1, qi(req, 'Limit', limit)));
+    const rows = db.prepare('SELECT p.payload FROM (SELECT DISTINCT r.id' + where +
+      ' ORDER BY r.id LIMIT ? OFFSET ?) ids JOIN tv_payloads p ON p.id=ids.id AND p.owner=? AND p.kind=? ORDER BY ids.id')
+      .all(kind, ...scopes, pageLimit, startIndex, tvOwner(ctx), kind);
+    const items = rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem);
+    sendItems(req, res, excludeTypes(req, applyUserFilters(req, items)), total, startIndex);
     return;
   }
   /* a crawl with no parent gets the first page of each library, never a walk */
