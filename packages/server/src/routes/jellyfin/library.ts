@@ -597,7 +597,7 @@ async function buildTvIndex(
     offset += page.items.length;
     complete = false;
     save.run(scope, kind, offset, Number(complete), Date.now());
-    await new Promise<void>(resolve => setTimeout(resolve, 25));
+    return; // Release the scheduler after each persisted batch.
   }
   save.run(scope, kind, offset, Number(complete), Date.now());
   console.info('[infuse-tv-index] complete', JSON.stringify({scope, kind, total}));
@@ -633,38 +633,6 @@ function queueTvIndex(ctx: JellyfinRequestContext, catalog: TvCatalog, kind: TvK
   console.info('[infuse-tv-index] queued', JSON.stringify({scope, kind, pending: tvJobs.size}));
   return job;
 }
-const tvWarmups = new Map<string, Promise<void>>();
-function warmTvLibrary(ctx: JellyfinRequestContext): void {
-  const key = JSON.stringify([ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name]);
-  if (tvWarmups.has(key)) return;
-  const task = (async () => {
-    const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
-    const targets: {catalog: TvCatalog; genre?: string; kind: TvKind}[] = [];
-    const seen = new Set<string>();
-    for (const view of views) {
-      const catalog = view.catalog;
-      const genres: (string | undefined)[] = requiresGenre(catalog) ? genreOptions(catalog) : [undefined];
-      for (const genre of genres) {
-        for (const kind of ['season', 'episode'] as const) {
-          const id = tvScope(ctx, catalog, genre) + ':' + kind;
-          if (seen.has(id)) continue;
-          seen.add(id);
-          targets.push({catalog, genre, kind});
-        }
-      }
-    }
-    console.info('[infuse-tv-index] warmup started', JSON.stringify({jobs: targets.length}));
-    let done = 0;
-    for (const target of targets) {
-      await queueTvIndex(ctx, target.catalog, target.kind, target.genre);
-      if (tvReady(tvScope(ctx, target.catalog, target.genre), target.kind)) done++;
-      console.info('[infuse-tv-index] warmup progress', JSON.stringify({done, total: targets.length}));
-    }
-    console.info('[infuse-tv-index] warmup finished', JSON.stringify({done, total: targets.length, ready: done === targets.length}));
-  })().catch(error => { console.warn('[infuse-tv-index] warmup failed', String(error?.message ?? error)); })
-    .finally(() => { tvWarmups.delete(key); ctx.metas.clear(); });
-  tvWarmups.set(key, task);
-}
 async function tvLibraryIndex(
   ctx: JellyfinRequestContext,
   catalog: TvCatalog,
@@ -675,12 +643,27 @@ async function tvLibraryIndex(
 ): Promise<{ items: JellyfinItem[]; total: number } | null> {
   const db = openTvIndex();
   const scope = tvScope(ctx, catalog, genre);
-  warmTvLibrary(ctx);
-  if (!tvReady(scope, kind)) {
-    void queueTvIndex(ctx, catalog, kind, genre);
-    return null;
+  const count = db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?');
+  const deadline = Date.now() + 45000;
+  let total = Number(count.get(scope, kind)?.n ?? 0);
+  // Build only the requested catalog, in resumable batches. Keep one extra
+  // row as evidence of another page, unless the catalog is exhausted.
+  while (!tvReady(scope, kind) && total <= startIndex + limit) {
+    const before = db.prepare('SELECT offset FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind)?.offset;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finished = await Promise.race([
+      queueTvIndex(ctx, catalog, kind, genre).then(() => true),
+      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), remaining); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!finished) return null;
+    total = Number(count.get(scope, kind)?.n ?? 0);
+    const after = db.prepare('SELECT offset FROM tv_progress WHERE scope=? AND kind=?').get(scope, kind)?.offset;
+    if (!tvReady(scope, kind) && before === after) return null;
   }
-  const total = Number(db.prepare('SELECT COUNT(*) AS n FROM tv_rows WHERE scope=? AND kind=?').get(scope, kind)?.n ?? 0);
+  console.info('[infuse-tv-index] page ready', JSON.stringify({scope, kind, startIndex, limit, total, complete: tvReady(scope, kind)}));
   const rows = db.prepare('SELECT p.payload FROM tv_rows r JOIN tv_payloads p ON p.owner=? AND p.kind=r.kind AND p.id=r.id WHERE r.scope=? AND r.kind=? ORDER BY r.ordinal LIMIT ? OFFSET ?').all(tvOwner(ctx), scope, kind, limit, startIndex);
   return {items: rows.map(row => JSON.parse(inflateRawSync(row.payload as Uint8Array).toString('utf8')) as JellyfinItem), total};
 }
