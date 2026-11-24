@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, existsSync, statfsSync, statSync, renameSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, statfsSync, renameSync } from 'node:fs';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { Router, type Request, type Response } from 'express';
 import {
@@ -513,50 +513,37 @@ function openTvIndex(): DatabaseSync {
     rmSync('./data/infuse-tv-index.sqlite' + suffix, { force: true });
   }
   const legacyPath = './data/infuse-tv-index-v2.sqlite';
-  const compactPath = './data/infuse-tv-index-v3.sqlite';
-  const stagingPath = compactPath + '.building';
-  let indexPath = compactPath;
-  if (existsSync(legacyPath) && !existsSync(compactPath)) {
-    // Never remove the only persistent copy. Migration needs room for both files.
-    const fs = statfsSync('./data');
-    const available = fs.bavail * fs.bsize;
-    const required = Math.ceil(statSync(legacyPath).size * 0.65);
-    if (available < required) {
-      console.warn('[infuse-tv-index] compact migration deferred: insufficient free volume space', JSON.stringify({available,required}));
-      indexPath = legacyPath;
-    } else {
-      rmSync(stagingPath, {force:true});
-      const staged = new DatabaseSync(stagingPath);
-      try {
-        staged.exec('PRAGMA page_size=16384; PRAGMA journal_mode=DELETE; PRAGMA cache_size=-8192;');
-        staged.prepare('ATTACH DATABASE ? AS legacy').run(legacyPath);
-        const tables = staged.prepare("SELECT name,sql FROM legacy.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
-        staged.exec('BEGIN');
-        for (const table of tables) {
-          const name = String(table.name);
-          if (!/^tv_[a-z_]+$/.test(name)) throw new Error('Unexpected index table');
-          let ddl = String(table.sql);
-          if (name === 'tv_payloads') ddl = ddl.replace(/ WITHOUT ROWID/i,'');
-          staged.exec(ddl);
-          staged.exec('INSERT INTO main.'+name+' SELECT * FROM legacy.'+name);
-          const counts = staged.prepare('SELECT (SELECT COUNT(*) FROM main.'+name+') AS copied,(SELECT COUNT(*) FROM legacy.'+name+') AS original').get();
-          if (counts?.copied !== counts?.original) throw new Error('Index migration count mismatch: '+name);
-        }
-        for (const row of staged.prepare("SELECT sql FROM legacy.sqlite_schema WHERE type='index' AND sql IS NOT NULL").all()) staged.exec(String(row.sql));
-        staged.exec('COMMIT');
-        const check = staged.prepare('PRAGMA main.quick_check').get();
-        if (Object.values(check ?? {})[0] !== 'ok') throw new Error('Compact index integrity check failed');
-        staged.close();
-        renameSync(stagingPath,compactPath);
-        console.info('[infuse-tv-index] compact migration verified; legacy retained', JSON.stringify({bytes:statSync(compactPath).size}));
-      } catch (error) {
-        try { if (staged.isTransaction) staged.exec('ROLLBACK'); staged.close(); } catch {}
-        rmSync(stagingPath,{force:true});
-        rmSync(stagingPath+'-journal',{force:true});
-        console.warn('[infuse-tv-index] compact migration deferred',String(error));
-        indexPath=legacyPath;
+  const indexPath = './data/infuse-tv-index-v3.sqlite';
+  const stagingPath = indexPath + '.building';
+  // The episode index is rebuildable. Preserve original series and artwork
+  // in a verified compact database before removing the old episode snapshot.
+  if (existsSync(legacyPath) && !existsSync(indexPath)) {
+    rmSync(stagingPath, {force:true});
+    const staged = new DatabaseSync(stagingPath);
+    try {
+      staged.exec('PRAGMA page_size=16384; PRAGMA journal_mode=DELETE;');
+      staged.prepare('ATTACH DATABASE ? AS legacy').run(legacyPath);
+      staged.exec('BEGIN');
+      for (const name of ['tv_original_series','tv_artwork']) {
+        const table = staged.prepare("SELECT sql FROM legacy.sqlite_schema WHERE type='table' AND name=?").get(name);
+        if (!table) throw new Error('Missing preserved table: '+name);
+        staged.exec(String(table.sql));
+        staged.exec('INSERT INTO main.'+name+' SELECT * FROM legacy.'+name);
+        const counts = staged.prepare('SELECT (SELECT COUNT(*) FROM main.'+name+') AS copied,(SELECT COUNT(*) FROM legacy.'+name+') AS original').get();
+        if (counts?.copied !== counts?.original) throw new Error('Preserved table count mismatch: '+name);
       }
+      staged.exec('COMMIT');
+      const check = staged.prepare('PRAGMA main.quick_check').get();
+      if (Object.values(check ?? {})[0] !== 'ok') throw new Error('Preserved index integrity check failed');
+      staged.close();
+      renameSync(stagingPath,indexPath);
+    } catch (error) {
+      try { if (staged.isTransaction) staged.exec('ROLLBACK'); staged.close(); } catch {}
+      throw error;
     }
+    // Only after the preserved database is committed and verified.
+    for (const suffix of ['-wal','-shm','-journal','']) rmSync(legacyPath+suffix,{force:true});
+    console.info('[infuse-tv-index] preserved series and artwork; obsolete episode index removed; background rebuild enabled');
   }
   const db = new DatabaseSync(indexPath);
   db.exec(`PRAGMA page_size=16384; PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
