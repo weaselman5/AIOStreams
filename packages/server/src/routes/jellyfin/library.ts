@@ -554,7 +554,10 @@ async function buildTvIndex(
         const built = kind === 'season'
           ? await seasonsForSeries(ctx, descriptor)
           : await episodesForSeries(ctx, descriptor);
-        if (!built) throw new Error('TV index metadata unavailable');
+        if (!built) {
+          console.warn('[infuse-tv-index] metadata unavailable; skipping', JSON.stringify({kind, id: preview.id}));
+          continue;
+        }
         const items = 'seasons' in built ? built.seasons : built.episodes;
         db.exec('BEGIN');
         try {
