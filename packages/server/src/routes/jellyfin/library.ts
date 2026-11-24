@@ -759,7 +759,7 @@ function readSeriesArt(ctx: JellyfinRequestContext, id: string): Partial<Jellyfi
   const row = openTvIndex().prepare('SELECT payload FROM tv_artwork WHERE owner=? AND id=?').get(tvOwner(ctx), id);
   return row ? JSON.parse(String(row.payload)) as Partial<JellyfinItem> : {};
 }
-function saveSeriesArt(ctx: JellyfinRequestContext, item: JellyfinItem, id = String(item.Id)) {
+function saveSeriesArt(ctx: JellyfinRequestContext, item: Partial<JellyfinItem>, id = String(item.Id)) {
   const art = mergeSeriesArt(readSeriesArt(ctx,id), item);
   if (!(art.ImageTags as Record<string,string> | undefined)?.Primary) return;
   const serialized = JSON.stringify(art);
@@ -800,7 +800,7 @@ async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sour
   const primary = poster ? encodeImageTag(poster) : inherited;
   if (primary) {
     const art = {ImageTags: {Primary: primary}, BackdropImageTags: backdrop ? [encodeImageTag(backdrop)] : ep.ParentBackdropImageTags, PrimaryImageAspectRatio: 0.6666};
-    saveSeriesArt(ctx, art as JellyfinItem,id);
+    saveSeriesArt(ctx, art,id);
     return art;
   }
   const row = sourceId ? undefined : db.prepare("SELECT series FROM tv_series WHERE owner=? AND kind=? AND id=? LIMIT 1").get(tvOwner(ctx), String(ep.Type).toLowerCase(), String(ep.Id));
