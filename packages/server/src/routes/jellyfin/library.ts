@@ -1035,6 +1035,7 @@ async function handleItems(
           }
           // Resolve original series metadata only when the indexed poster is missing.
           // Keep requests sequential and use the existing metadata cache.
+          const artworkFallback = !item.ImageTags?.Primary;
           if (!item.ImageTags?.Primary) {
             try {
               const meta = await getMeta(ctx, 'series', id);
@@ -1053,6 +1054,14 @@ async function handleItems(
           }
           if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
+          }
+          if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
+            console.info('[infuse-artwork-diagnostic]', JSON.stringify({
+              stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
+              tags: item.ImageTags, backdrops: item.BackdropImageTags,
+              aspect: item.PrimaryImageAspectRatio, episodePoster: ep.SeriesPrimaryImageTag,
+              providerIds: item.ProviderIds
+            }));
           }
           items.push({ ...item, Id: String(ep.SeriesId), ParentId: parentId, Type: 'Series', IsFolder: true });
         }
@@ -1242,6 +1251,7 @@ async function handleItems(
           }
           // Resolve original series metadata only when the indexed poster is missing.
           // Keep requests sequential and use the existing metadata cache.
+          const artworkFallback = !item.ImageTags?.Primary;
           if (!item.ImageTags?.Primary) {
             try {
               const meta = await getMeta(ctx, 'series', id);
@@ -1260,6 +1270,14 @@ async function handleItems(
           }
           if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
+          }
+          if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
+            console.info('[infuse-artwork-diagnostic]', JSON.stringify({
+              stage: 'indexed-series', id: ep.SeriesId, fallback: artworkFallback,
+              tags: item.ImageTags, backdrops: item.BackdropImageTags,
+              aspect: item.PrimaryImageAspectRatio, episodePoster: ep.SeriesPrimaryImageTag,
+              providerIds: item.ProviderIds
+            }));
           }
           items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
         }
