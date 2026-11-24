@@ -514,6 +514,7 @@ function openTvIndex(): DatabaseSync {
   }
   const db = new DatabaseSync('./data/infuse-tv-index-v2.sqlite');
   db.exec(`PRAGMA journal_mode=DELETE; PRAGMA cache_size=-2048;
+    CREATE TABLE IF NOT EXISTS tv_original_series (owner TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_artwork (owner TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(owner,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_payloads (owner TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(owner,kind,id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS tv_series (owner TEXT NOT NULL, kind TEXT NOT NULL, series TEXT NOT NULL, id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(owner,kind,series,ordinal)) WITHOUT ROWID;
@@ -584,6 +585,7 @@ async function buildTvIndex(
             continue;
           }
           saveSeriesArt(ctx, built.seriesItem);
+          saveOriginalSeries(ctx, built.seriesItem);
           const items = 'seasons' in built ? built.seasons : built.episodes;
           db.exec('BEGIN');
           try {
@@ -743,6 +745,37 @@ async function parentArtwork(ctx: JellyfinRequestContext, ep: JellyfinItem, sour
   } catch { /* preserve the indexed item on metadata failure */ }
   if (/^tt\d+$/.test(base)) return {ImageTags: {Primary: encodeImageTag(metahubPoster(base))}, PrimaryImageAspectRatio: 0.6666};
   return {};
+}
+function saveOriginalSeries(ctx: JellyfinRequestContext, item: JellyfinItem, id = String(item.Id)) {
+  if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) return;
+  openTvIndex().prepare('INSERT OR REPLACE INTO tv_original_series VALUES (?, ?, ?)').run(tvOwner(ctx), id, deflateRawSync(JSON.stringify(item)));
+}
+async function originalIndexedSeries(ctx: JellyfinRequestContext, ep: JellyfinItem, id: string): Promise<JellyfinItem> {
+  const seriesId = String(ep.SeriesId);
+  const db = openTvIndex();
+  const saved = db.prepare('SELECT payload FROM tv_original_series WHERE owner=? AND id=?').get(tvOwner(ctx), seriesId);
+  let original: JellyfinItem | undefined;
+  if (saved) {
+    try { original = JSON.parse(inflateRawSync(saved.payload as Uint8Array).toString('utf8')) as JellyfinItem; } catch { /* recover from metadata */ }
+  }
+  if (!original) {
+    try {
+      const meta = await getMeta(ctx, 'series', id);
+      if (meta) {
+        original = buildContentItem(ctx.build, {...meta, id, type: 'series'});
+        saveOriginalSeries(ctx, original, seriesId);
+        saveSeriesArt(ctx, original, seriesId);
+      }
+    } catch { /* retain enumeration on metadata failure */ }
+  }
+  const fallback = await parentArtwork(ctx, ep, id).catch(() => ({} as Partial<JellyfinItem>));
+  const item = original ?? buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview);
+  const tags = {...(fallback.ImageTags as Record<string, string> | undefined), ...(item.ImageTags as Record<string, string> | undefined)};
+  return {...item, Id: seriesId, Type: 'Series', IsFolder: true,
+    ImageTags: tags,
+    BackdropImageTags: (item.BackdropImageTags as string[] | undefined)?.length ? item.BackdropImageTags : fallback.BackdropImageTags,
+    ProviderIds: item.ProviderIds ?? fallback.ProviderIds,
+    PrimaryImageAspectRatio: item.PrimaryImageAspectRatio || fallback.PrimaryImageAspectRatio || 0.6666};
 }
 async function restoreIndexedArtwork(ctx: JellyfinRequestContext, items: JellyfinItem[]): Promise<JellyfinItem[]> {
   if (!/infuse/i.test(ctx.client.name)) return items;
@@ -1073,17 +1106,17 @@ async function handleItems(
         const rows = db.prepare('SELECT m.series, MIN(m.id) AS id' + from +
           ' GROUP BY m.series ORDER BY m.series LIMIT ? OFFSET ?').all(owner, ...scopes, limit, startIndex);
         const payload = db.prepare("SELECT payload FROM tv_payloads WHERE owner=? AND kind='episode' AND id=?");
-        const items: JellyfinItem[] = [];
-        for (const row of rows) {
+        const built = await mapLimited(rows, 4, async row => {
           const stored = payload.get(owner, String(row.id));
-          if (!stored) continue;
+          if (!stored) return null;
           const ep = JSON.parse(inflateRawSync(stored.payload as Uint8Array).toString('utf8')) as JellyfinItem;
-          if (!ep.SeriesId || !ep.SeriesName) continue;
+          if (!ep.SeriesId || !ep.SeriesName) return null;
           const id = String(row.series).slice('series:'.length);
-          const art = await parentArtwork(ctx, ep, id).catch(() => ({}));
-          const item = {...buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview), ...art};
-          items.push({ ...item, Id: String(ep.SeriesId), ParentId: parentId, Type: 'Series', IsFolder: true });
-        }
+          const item = await originalIndexedSeries(ctx, ep, id);
+          return {...item, ParentId: parentId, Type: 'Series', IsFolder: true} as JellyfinItem;
+        });
+        ctx.metas.clear();
+        const items = built.filter((item): item is JellyfinItem => item !== null);
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
         sendItems(req, res, items, total, startIndex);
         return;
@@ -1249,17 +1282,17 @@ async function handleItems(
         const rows = db.prepare('SELECT m.series, MIN(m.id) AS id' + from +
           ' GROUP BY m.series ORDER BY m.series LIMIT ? OFFSET ?').all(owner, ...scopes, limit, startIndex);
         const payload = db.prepare("SELECT payload FROM tv_payloads WHERE owner=? AND kind='episode' AND id=?");
-        const items: JellyfinItem[] = [];
-        for (const row of rows) {
+        const built = await mapLimited(rows, 4, async row => {
           const stored = payload.get(owner, String(row.id));
-          if (!stored) continue;
+          if (!stored) return null;
           const ep = JSON.parse(inflateRawSync(stored.payload as Uint8Array).toString('utf8')) as JellyfinItem;
-          if (!ep.SeriesId || !ep.SeriesName) continue;
+          if (!ep.SeriesId || !ep.SeriesName) return null;
           const id = String(row.series).slice('series:'.length);
-          const art = await parentArtwork(ctx, ep, id).catch(() => ({}));
-          const item = {...buildContentItem(ctx.build, {type: 'series', id, name: String(ep.SeriesName)} as MetaPreview), ...art};
-          items.push({ ...item, Id: String(ep.SeriesId), Type: 'Series', IsFolder: true });
-        }
+          const item = await originalIndexedSeries(ctx, ep, id);
+          return {...item, Type: 'Series', IsFolder: true} as JellyfinItem;
+        });
+        ctx.metas.clear();
+        const items = built.filter((item): item is JellyfinItem => item !== null);
         console.info('[infuse-native-series]', JSON.stringify({total,startIndex,returned:items.length}));
         sendItems(req, res, items, total, startIndex);
         return;
