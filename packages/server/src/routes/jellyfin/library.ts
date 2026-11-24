@@ -374,6 +374,15 @@ export function send(
   startIndex = 0
 ) {
   if (req.jf) rememberListMarkers(req.jf, items);
+  if (/infuse/i.test(req.jf?.client.name ?? '') && qlist(req, 'IncludeItemTypes').some(t => t.toLowerCase() === 'series')) {
+    const series = items.filter(i => String(i.Type).toLowerCase() === 'series');
+    console.info('[infuse-series-response]', JSON.stringify({
+      types: qlist(req, 'IncludeItemTypes'), recursive: qb(req, 'Recursive'),
+      hasParent: !!qs(req, 'ParentId'), startIndex, limit: qi(req, 'Limit', 100),
+      total, returned: items.length, seriesCount: series.length,
+      sample: series.slice(0, 2).map(i => ({id: i.Id, name: i.Name, folder: i.IsFolder, parent: i.ParentId, childCount: i.ChildCount}))
+    }));
+  }
   const out = items.map(stripInternal);
   res.json(listResult(out, wantsTotal(req) ? total : out.length, startIndex));
 }
