@@ -524,7 +524,7 @@ function openTvIndex(): DatabaseSync {
 async function buildTvIndex(
   ctx: JellyfinRequestContext,
   catalog: Parameters<typeof getCatalogPage>[1],
-  kind: 'season' | 'episode',
+  kind: TvKind,
   genre: string | undefined,
   scope: string
 ): Promise<void> {
@@ -565,12 +565,13 @@ async function buildTvIndex(
           const descriptor = { t: preview.type, i: preview.id };
           const built = kind === 'season'
             ? await seasonsForSeries(ctx, descriptor)
-            : await episodesForSeries(ctx, descriptor);
+            : kind === 'episode' ? await episodesForSeries(ctx, descriptor)
+            : await getMeta(ctx, descriptor.t, descriptor.i).then(meta => meta ? { series: [buildContentItem(ctx.build, {...meta, type: descriptor.t})] } : null);
           if (!built) {
             console.warn('[infuse-tv-index] metadata unavailable; skipping', JSON.stringify({kind, id: preview.id}));
             continue;
           }
-          const items = 'seasons' in built ? built.seasons : built.episodes;
+          const items = 'series' in built ? built.series : 'seasons' in built ? built.seasons : built.episodes;
           db.exec('BEGIN');
           try {
             const payload = db.prepare('INSERT OR IGNORE INTO tv_payloads VALUES (?, ?, ?, ?)');
@@ -615,7 +616,7 @@ async function buildTvIndex(
 const tvJobs = new Map<string, Promise<void>>();
 let tvJobTail: Promise<void> = Promise.resolve();
 type TvCatalog = Parameters<typeof getCatalogPage>[1];
-type TvKind = 'season' | 'episode';
+type TvKind = 'season' | 'episode' | 'series';
 function tvOwner(ctx: JellyfinRequestContext): string {
   return createHash('sha256').update(JSON.stringify([ctx.userId, ctx.scope(), ctx.baseUrl, ctx.client.name])).digest('hex');
 }
@@ -663,6 +664,7 @@ async function warmTvIndexes(ctx: JellyfinRequestContext): Promise<void> {
     for (const view of views) {
       const genres = requiresGenre(view.catalog) ? genreOptions(view.catalog) : [undefined];
       for (const genre of genres) {
+        await queueTvIndex(ctx, view.catalog, 'series', genre);
         await queueTvIndex(ctx, view.catalog, 'season', genre);
         await queueTvIndex(ctx, view.catalog, 'episode', genre);
       }
@@ -992,7 +994,7 @@ async function handleItems(
     // not of each series. Return a stable, fully paginated snapshot.
     const tvOnly =
       types?.size === 1 &&
-      (types.has('season') || types.has('episode'));
+      (types.has('season') || types.has('episode') || (/infuse/i.test(ctx.client.name) && types.has('series')));
     if (
       catalog &&
       tvOnly &&
@@ -1000,7 +1002,7 @@ async function handleItems(
       !searchTerm &&
       (!requiresGenre(catalog) || !!genreFromId)
     ) {
-      const kind = types!.has('season') ? 'season' : 'episode';
+      const kind: TvKind = types!.has('series') ? 'series' : types!.has('season') ? 'season' : 'episode';
       const indexLimit = Math.min(500, Math.max(1, qi(req, 'Limit', limit)));
       const indexed = await tvLibraryIndex(ctx, catalog, kind, genreFromId, startIndex, indexLimit);
       void warmTvIndexes(ctx);
@@ -1107,9 +1109,9 @@ async function handleItems(
   // Native Infuse TV-wide recursive queries must not fall through to the
   // first-page-only catalog browsing path.
   if (/infuse/i.test(ctx.client.name) && recursive && types?.size === 1 &&
-      (types.has('season') || types.has('episode')) && !searchTerm &&
+      (types.has('season') || types.has('episode') || types.has('series')) && !searchTerm &&
       !genre && !genreIds.length && !filters.length && !wantsFavorites && !wantsPlayed && !wantsResumable) {
-    const kind: TvKind = types.has('season') ? 'season' : 'episode';
+    const kind: TvKind = types.has('series') ? 'series' : types.has('season') ? 'season' : 'episode';
     void warmTvIndexes(ctx);
     const views = await viewsForTypes(ctx, await ctx.views(), new Set(['series']));
     const scopes = [...new Set(views.flatMap(view =>
