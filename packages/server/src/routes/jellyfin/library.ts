@@ -1028,15 +1028,15 @@ async function handleItems(
           const primary = poster ? encodeImageTag(poster) : typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
             ? ep.SeriesPrimaryImageTag
             : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
-          if (primary) item.ImageTags = { ...item.ImageTags, Primary: primary };
+          if (primary) item.ImageTags = { ...(item.ImageTags as Record<string, string> | undefined), Primary: primary };
           if (background) item.BackdropImageTags = [encodeImageTag(background)];
-          else if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
+          else if (/^tt\d+$/.test(id) && !(item.BackdropImageTags as string[] | undefined)?.length) {
             item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
           }
           // Resolve original series metadata only when the indexed poster is missing.
           // Keep requests sequential and use the existing metadata cache.
-          const artworkFallback = !item.ImageTags?.Primary;
-          if (!item.ImageTags?.Primary) {
+          const artworkFallback = !(item.ImageTags as Record<string, string> | undefined)?.Primary;
+          if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) {
             try {
               const meta = await getMeta(ctx, 'series', id);
               if (meta) {
@@ -1052,7 +1052,7 @@ async function handleItems(
               ctx.metas.clear();
             }
           }
-          if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
+          if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
           }
           if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
@@ -1244,15 +1244,15 @@ async function handleItems(
           const primary = poster ? encodeImageTag(poster) : typeof ep.SeriesPrimaryImageTag === 'string' && ep.SeriesPrimaryImageTag
             ? ep.SeriesPrimaryImageTag
             : /^tt\d+$/.test(id) ? encodeImageTag(metahubPoster(id)) : undefined;
-          if (primary) item.ImageTags = { ...item.ImageTags, Primary: primary };
+          if (primary) item.ImageTags = { ...(item.ImageTags as Record<string, string> | undefined), Primary: primary };
           if (background) item.BackdropImageTags = [encodeImageTag(background)];
-          else if (/^tt\d+$/.test(id) && !item.BackdropImageTags?.length) {
+          else if (/^tt\d+$/.test(id) && !(item.BackdropImageTags as string[] | undefined)?.length) {
             item.BackdropImageTags = [encodeImageTag(`https://images.metahub.space/background/medium/${id}/img`)];
           }
           // Resolve original series metadata only when the indexed poster is missing.
           // Keep requests sequential and use the existing metadata cache.
-          const artworkFallback = !item.ImageTags?.Primary;
-          if (!item.ImageTags?.Primary) {
+          const artworkFallback = !(item.ImageTags as Record<string, string> | undefined)?.Primary;
+          if (!(item.ImageTags as Record<string, string> | undefined)?.Primary) {
             try {
               const meta = await getMeta(ctx, 'series', id);
               if (meta) {
@@ -1268,7 +1268,7 @@ async function handleItems(
               ctx.metas.clear();
             }
           }
-          if (item.ImageTags?.Primary && !item.PrimaryImageAspectRatio) {
+          if ((item.ImageTags as Record<string, string> | undefined)?.Primary && !item.PrimaryImageAspectRatio) {
             item.PrimaryImageAspectRatio = 0.6666;
           }
           if (String(ep.SeriesId).replace(/-/g, '').toLowerCase() === 'a12202000000018995ffffffff000000') {
